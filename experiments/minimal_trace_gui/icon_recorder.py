@@ -6,6 +6,7 @@ import math
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from typing import Protocol
@@ -19,14 +20,28 @@ from experiments.capture_backends.contracts import (
     Freshness,
     target_to_dict,
 )
+from experiments.frame_processing.contracts import (
+    InputFrameConfiguration,
+    InputResolutionMode,
+)
 from experiments.frame_processing.conversion import frame_packet_to_image
-from experiments.frame_processing.utils import to_rgb
+from experiments.frame_processing.utils import to_gray, to_rgb
 
+from .icon_change_gate import (
+    IconChangeGate,
+    IconChangeGateDecision,
+    IconChangeGateState,
+)
 from .icon_catalog import (
     IconCandidateCatalog,
     IconCatalogPolicy,
     IconDedupAction,
     IconResourceLimitError,
+)
+from .icon_template_matcher import (
+    IconPresence,
+    IconTemplateMatchResult,
+    PositionConstrainedIconMatcher,
 )
 
 
@@ -40,6 +55,8 @@ class IconRecordStatus(str, Enum):
     RECORDED = "RECORDED"
     DUPLICATE_SKIPPED = "DUPLICATE_SKIPPED"
     COOLDOWN_SKIPPED = "COOLDOWN_SKIPPED"
+    GATE_TRANSITION = "GATE_TRANSITION"
+    SEGMENTATION_NOTICE = "SEGMENTATION_NOTICE"
     LIMIT_REACHED = "LIMIT_REACHED"
     RESOURCE_LIMIT_REACHED = "RESOURCE_LIMIT_REACHED"
     ERROR = "ERROR"
@@ -412,6 +429,7 @@ class IconRecordEvent:
     scope_id: str | None = None
     artifact: object | None = None
     error: str | None = None
+    details: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,7 +458,53 @@ class IconRecorderStats:
     cooldown_batches: int = 0
     persisted_candidates: int = 0
     max_unique_candidates: int | None = None
+    gate_samples: int = 0
+    gate_idle_skips: int = 0
+    gate_wakeups: int = 0
+    gate_active_samples: int = 0
+    gate_scan_timeouts: int = 0
+    gate_detector_hits: int = 0
+    gate_state: str = "DISABLED"
+    gate_pair_changed_ratio: float | None = None
+    gate_pair_mean_difference: float | None = None
+    gate_anchor_changed_ratio: float | None = None
+    gate_anchor_mean_difference: float | None = None
+    segmentation_state: str = "DISABLED"
+    segmentation_submitted: int = 0
+    segmentation_superseded: int = 0
+    segmentation_succeeded: int = 0
+    segmentation_unavailable: int = 0
+    segmentation_failed: int = 0
+    segmentation_cancelled: int = 0
+    segmentation_unknown: int = 0
+    registered_templates: int = 0
+    template_match_runs: int = 0
+    template_match_present: int = 0
+    template_match_absent: int = 0
+    template_match_unknown: int = 0
     errors: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class IconTemplateVerificationEvent:
+    occurred_at_monotonic_ns: int
+    frame_id: str
+    scope_id: str
+    template_id: str
+    result: IconTemplateMatchResult
+    change_epoch: int
+
+    def __post_init__(self) -> None:
+        if self.occurred_at_monotonic_ns <= 0:
+            raise ValueError("occurred_at_monotonic_ns must be positive")
+        for name in ("frame_id", "scope_id", "template_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be non-empty text")
+        if not isinstance(self.result, IconTemplateMatchResult):
+            raise TypeError("result must be an IconTemplateMatchResult")
+        if self.change_epoch <= 0:
+            raise ValueError("change_epoch must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +536,52 @@ class _WindowCandidate:
 
 class IconCandidateWriter(Protocol):
     def save(self, candidate: IconRecordCandidate): ...
+
+
+class IconSegmentationGate(Protocol):
+    results: queue.Queue[object]
+
+    @property
+    def is_alive(self) -> bool: ...
+
+    @property
+    def failure(self) -> Exception | None: ...
+
+    @property
+    def state(self): ...
+
+    def stats(self): ...
+
+    def start(self) -> None: ...
+
+    def submit(
+        self,
+        candidate: IconRecordCandidate,
+        source_artifact: object | None = None,
+    ): ...
+
+    def request_stop(self) -> None: ...
+
+    def join(self, timeout: float | None = None) -> bool: ...
+
+
+class IconTemplateRegistration(Protocol):
+    template_id: str
+    scope_id: str
+    template_rgb: RgbPixels
+    recognition_mask: NDArray[np.bool_]
+    normalized_center: tuple[float, float]
+    normalized_size: tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveIconTemplate:
+    template_id: str
+    scope_id: str
+    template_rgb: RgbPixels
+    recognition_mask: NDArray[np.bool_]
+    normalized_center: tuple[float, float]
+    normalized_size: tuple[float, float]
 
 
 class FixedHudIconDetector:
@@ -535,17 +645,28 @@ class FixedHudIconDetector:
     def configure_candidate_pixel_limit(self, maximum: int) -> None:
         """Tighten the source-crop allocation guard before analysis starts."""
 
-        if (
-            isinstance(maximum, bool)
-            or not isinstance(maximum, int)
-            or maximum <= 0
-        ):
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
             raise ValueError("maximum must be a positive integer")
         if self._stats.analyzed_samples or self._pending_frame is not None:
             raise RuntimeError(
                 "candidate pixel limit cannot change after analysis starts"
             )
         self._max_candidate_pixels = min(self._max_candidate_pixels, maximum)
+
+    def scope_id_for_frame(self, frame: FramePacket) -> str:
+        """Return the detector scope without mutating the tracking chain."""
+
+        if not isinstance(frame, FramePacket):
+            raise TypeError("frame must be a FramePacket")
+        return self._frame_scope_id(frame)
+
+    def reset_tracking(self) -> None:
+        """Start a fresh optical-flow chain for one newly opened scan window."""
+
+        if self._pending_frame is not None:
+            raise RuntimeError("cannot reset tracking while a candidate is pending")
+        self._last_accepted_sample_ns = 0
+        self._break_confirmation_chain()
 
     def observe_frame(self, frame: FramePacket) -> IconDetectorResult:
         if self._pending_frame is not None:
@@ -589,9 +710,7 @@ class FixedHudIconDetector:
             raise ValueError("candidate_id does not match the pending candidate")
         self._active_candidate = None
         self._pending_confirmation_index += 1
-        if self._pending_confirmation_index >= len(
-            self._pending_confirmations
-        ):
+        if self._pending_confirmation_index >= len(self._pending_confirmations):
             self._clear_pending_batch()
 
     def resolve(self, candidate_ids: tuple[str, ...]) -> None:
@@ -605,9 +724,7 @@ class FixedHudIconDetector:
         frame = self._pending_frame
         if frame is None:
             return None
-        if self._pending_confirmation_index >= len(
-            self._pending_confirmations
-        ):
+        if self._pending_confirmation_index >= len(self._pending_confirmations):
             self._clear_pending_batch()
             return None
         previous, current = self._pending_confirmations[
@@ -899,9 +1016,7 @@ class FixedHudIconDetector:
             ]
         ] = []
         for current_index, candidate in enumerate(current):
-            for previous_index, previous in enumerate(
-                self._previous_window_candidates
-            ):
+            for previous_index, previous in enumerate(self._previous_window_candidates):
                 iou = self._box_iou(previous.bbox, candidate.bbox)
                 distance = self._center_distance(previous.bbox, candidate.bbox)
                 if (
@@ -934,10 +1049,7 @@ class FixedHudIconDetector:
             previous,
             candidate,
         ) in matches:
-            if (
-                current_index in used_current
-                or previous_index in used_previous
-            ):
+            if current_index in used_current or previous_index in used_previous:
                 continue
             used_current.add(current_index)
             used_previous.add(previous_index)
@@ -1282,12 +1394,58 @@ class IconRecorderSession:
         writer: IconCandidateWriter,
         *,
         catalog_policy: IconCatalogPolicy | None = None,
+        change_gate: IconChangeGate | None = None,
+        segmentation_session: IconSegmentationGate | None = None,
+        template_matcher: PositionConstrainedIconMatcher | None = None,
+        max_active_templates: int = 8,
         event_queue_size: int = 32,
+        template_event_queue_size: int = 32,
     ) -> None:
-        if event_queue_size <= 0:
-            raise ValueError("event_queue_size must be positive")
+        if event_queue_size <= 0 or template_event_queue_size <= 0:
+            raise ValueError("event queue sizes must be positive")
+        if (
+            isinstance(max_active_templates, bool)
+            or not isinstance(max_active_templates, int)
+            or not 1 <= max_active_templates <= 32
+        ):
+            raise ValueError("max_active_templates must be inside 1..32")
         self.detector = detector
         self.writer = writer
+        if change_gate is not None and not isinstance(change_gate, IconChangeGate):
+            raise TypeError("change_gate must be an IconChangeGate or None")
+        self.change_gate = change_gate
+        if segmentation_session is not None:
+            for method_name in (
+                "start",
+                "submit",
+                "request_stop",
+                "join",
+                "stats",
+            ):
+                if not callable(getattr(segmentation_session, method_name, None)):
+                    raise TypeError(
+                        "segmentation_session must provide start, submit, "
+                        "request_stop, join, and stats"
+                    )
+            if not isinstance(
+                getattr(segmentation_session, "results", None),
+                queue.Queue,
+            ):
+                raise TypeError("segmentation_session must expose a results queue")
+        if template_matcher is not None and not isinstance(
+            template_matcher,
+            PositionConstrainedIconMatcher,
+        ):
+            raise TypeError(
+                "template_matcher must be a PositionConstrainedIconMatcher or None"
+            )
+        if template_matcher is not None and change_gate is None:
+            raise ValueError(
+                "template matching requires the change gate to bound execution"
+            )
+        self.segmentation_session = segmentation_session
+        self.template_matcher = template_matcher
+        self.max_active_templates = max_active_templates
         self.catalog = IconCandidateCatalog(catalog_policy or IconCatalogPolicy())
         configure_pixel_limit = getattr(
             self.detector,
@@ -1300,6 +1458,14 @@ class IconRecorderSession:
             maxsize=event_queue_size
         )
         self.candidates: queue.Queue[IconRecordCandidate] = queue.Queue(maxsize=1)
+        self.segmentations: queue.Queue[object] = (
+            segmentation_session.results
+            if segmentation_session is not None
+            else queue.Queue(maxsize=1)
+        )
+        self.template_matches: queue.Queue[IconTemplateVerificationEvent] = queue.Queue(
+            maxsize=template_event_queue_size
+        )
         self._frames: queue.Queue[FramePacket] = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1312,6 +1478,26 @@ class IconRecorderSession:
         self._near_visual_duplicates = 0
         self._cooldown_batches = 0
         self._last_persisted_batch_ns = 0
+        self._gate_scope_key: tuple[object, ...] | None = None
+        self._last_gate_sample_ns = 0
+        self._pending_detector_hit = False
+        self._last_gate_decision: IconChangeGateDecision | None = None
+        self._gate_samples = 0
+        self._gate_idle_skips = 0
+        self._gate_wakeups = 0
+        self._gate_active_samples = 0
+        self._gate_scan_timeouts = 0
+        self._gate_detector_hits = 0
+        self._segmentation_disabled = False
+        self._segmentation_start_error: str | None = None
+        self._templates_lock = threading.RLock()
+        self._templates: OrderedDict[str, _ActiveIconTemplate] = OrderedDict()
+        self._change_epoch = 0
+        self._matched_epoch = 0
+        self._template_match_runs = 0
+        self._template_match_present = 0
+        self._template_match_absent = 0
+        self._template_match_unknown = 0
         self._errors = 0
         self._state = "IDLE"
         self._analysis_phase = "IDLE"
@@ -1319,7 +1505,11 @@ class IconRecorderSession:
 
     @property
     def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        recorder_alive = self._thread is not None and self._thread.is_alive()
+        segmentation_alive = bool(
+            self.segmentation_session is not None and self.segmentation_session.is_alive
+        )
+        return recorder_alive or segmentation_alive
 
     @property
     def failure(self) -> Exception | None:
@@ -1337,7 +1527,16 @@ class IconRecorderSession:
 
     def stats(self) -> IconRecorderStats:
         detector_stats = self.detector.stats()
+        segmentation_session = self.segmentation_session
+        segmentation_stats = (
+            None if segmentation_session is None else segmentation_session.stats()
+        )
+        with self._templates_lock:
+            registered_templates = len(self._templates)
         with self._lock:
+            gate_decision = self._last_gate_decision
+            pair = None if gate_decision is None else gate_decision.pair_difference
+            anchor = None if gate_decision is None else gate_decision.anchor_difference
             return IconRecorderStats(
                 submitted_frames=self._submitted_frames,
                 dropped_frames=self._dropped_frames,
@@ -1355,6 +1554,66 @@ class IconRecorderSession:
                 cooldown_batches=self._cooldown_batches,
                 persisted_candidates=self._persisted_candidates,
                 max_unique_candidates=self.catalog.policy.max_unique_candidates,
+                gate_samples=self._gate_samples,
+                gate_idle_skips=self._gate_idle_skips,
+                gate_wakeups=self._gate_wakeups,
+                gate_active_samples=self._gate_active_samples,
+                gate_scan_timeouts=self._gate_scan_timeouts,
+                gate_detector_hits=self._gate_detector_hits,
+                gate_state=(
+                    "DISABLED"
+                    if self.change_gate is None
+                    else self.change_gate.state.value
+                ),
+                gate_pair_changed_ratio=(None if pair is None else pair.changed_ratio),
+                gate_pair_mean_difference=(
+                    None if pair is None else pair.mean_difference
+                ),
+                gate_anchor_changed_ratio=(
+                    None if anchor is None else anchor.changed_ratio
+                ),
+                gate_anchor_mean_difference=(
+                    None if anchor is None else anchor.mean_difference
+                ),
+                segmentation_state=(
+                    "DISABLED"
+                    if segmentation_session is None
+                    else (
+                        "UNAVAILABLE"
+                        if self._segmentation_disabled
+                        else str(
+                            getattr(
+                                getattr(
+                                    segmentation_session,
+                                    "state",
+                                    "UNKNOWN",
+                                ),
+                                "value",
+                                getattr(
+                                    segmentation_session,
+                                    "state",
+                                    "UNKNOWN",
+                                ),
+                            )
+                        )
+                    )
+                ),
+                segmentation_submitted=int(getattr(segmentation_stats, "submitted", 0)),
+                segmentation_superseded=int(
+                    getattr(segmentation_stats, "superseded", 0)
+                ),
+                segmentation_succeeded=int(getattr(segmentation_stats, "succeeded", 0)),
+                segmentation_unavailable=int(
+                    getattr(segmentation_stats, "unavailable", 0)
+                ),
+                segmentation_failed=int(getattr(segmentation_stats, "failed", 0)),
+                segmentation_cancelled=int(getattr(segmentation_stats, "cancelled", 0)),
+                segmentation_unknown=int(getattr(segmentation_stats, "unknown", 0)),
+                registered_templates=registered_templates,
+                template_match_runs=self._template_match_runs,
+                template_match_present=self._template_match_present,
+                template_match_absent=self._template_match_absent,
+                template_match_unknown=self._template_match_unknown,
                 errors=self._errors,
             )
 
@@ -1363,15 +1622,135 @@ class IconRecorderSession:
             raise RuntimeError("icon recorder can only be started once")
         if self._stop_event.is_set():
             raise RuntimeError("icon recorder was stopped before start")
+        segmentation_session = self.segmentation_session
+        if segmentation_session is not None:
+            try:
+                segmentation_session.start()
+            except Exception as exc:
+                with self._lock:
+                    self._segmentation_disabled = True
+                    self._segmentation_start_error = str(exc)
+                self._publish_event(
+                    IconRecordEvent(
+                        status=IconRecordStatus.SEGMENTATION_NOTICE,
+                        occurred_at_monotonic_ns=time.monotonic_ns(),
+                        reason_code="SAM_SESSION_START_FAILED",
+                        error=str(exc),
+                    )
+                )
         with self._lock:
             self._state = "RUNNING"
             self._analysis_phase = "WAITING_FRAME"
-        self._thread = threading.Thread(
-            target=self._run,
-            name="minimal-trace-icon-recorder",
-            daemon=True,
+        try:
+            self._thread = threading.Thread(
+                target=self._run,
+                name="minimal-trace-icon-recorder",
+                daemon=True,
+            )
+            self._thread.start()
+        except Exception:
+            if segmentation_session is not None:
+                try:
+                    segmentation_session.request_stop()
+                    segmentation_session.join(timeout=1.0)
+                except Exception:
+                    pass
+            raise
+
+    def register_template(
+        self,
+        template: IconTemplateRegistration,
+    ) -> str | None:
+        """Register one provisional mask template for bounded run-local matching.
+
+        Returns the oldest template id displaced by the active-template cap, or
+        ``None`` when no template was displaced.
+        """
+
+        template_id = getattr(template, "template_id", None)
+        scope_id = getattr(template, "scope_id", None)
+        if not isinstance(template_id, str) or not template_id:
+            raise ValueError("template_id must be non-empty text")
+        if not isinstance(scope_id, str) or not scope_id:
+            raise ValueError("scope_id must be non-empty text")
+        template_rgb = np.asarray(getattr(template, "template_rgb", None))
+        recognition_mask = np.asarray(getattr(template, "recognition_mask", None))
+        if (
+            template_rgb.dtype != np.uint8
+            or template_rgb.ndim != 3
+            or template_rgb.shape[2] != 3
+            or template_rgb.size == 0
+        ):
+            raise ValueError("template_rgb must be a non-empty uint8 RGB image")
+        if recognition_mask.shape != template_rgb.shape[:2]:
+            raise ValueError("recognition_mask must match the template dimensions")
+        if recognition_mask.dtype.kind not in "buif":
+            raise ValueError("recognition_mask must use a numeric dtype")
+        if not np.isfinite(recognition_mask).all() or not all(
+            float(value) in {0.0, 1.0, 255.0} for value in np.unique(recognition_mask)
+        ):
+            raise ValueError("recognition_mask must be binary")
+        normalized_center = self._normalized_pair(
+            getattr(template, "normalized_center", None),
+            name="normalized_center",
+            positive=False,
         )
-        self._thread.start()
+        normalized_size = self._normalized_pair(
+            getattr(template, "normalized_size", None),
+            name="normalized_size",
+            positive=True,
+        )
+        rgb_owned = np.ascontiguousarray(template_rgb.copy(), dtype=np.uint8)
+        rgb_owned.setflags(write=False)
+        mask_owned = np.ascontiguousarray(
+            recognition_mask != 0,
+            dtype=np.bool_,
+        )
+        mask_owned.setflags(write=False)
+        active = _ActiveIconTemplate(
+            template_id=template_id,
+            scope_id=scope_id,
+            template_rgb=rgb_owned,
+            recognition_mask=mask_owned,
+            normalized_center=normalized_center,
+            normalized_size=normalized_size,
+        )
+        displaced: str | None = None
+        with self._templates_lock:
+            self._templates.pop(template_id, None)
+            self._templates[template_id] = active
+            if len(self._templates) > self.max_active_templates:
+                displaced, _oldest = self._templates.popitem(last=False)
+        return displaced
+
+    @staticmethod
+    def _normalized_pair(
+        value: object,
+        *,
+        name: str,
+        positive: bool,
+    ) -> tuple[float, float]:
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or any(
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+                for item in value
+            )
+        ):
+            raise ValueError(f"{name} must contain two finite numbers")
+        result = (float(value[0]), float(value[1]))
+        lower = 0.0 if positive else 0.0
+        if positive:
+            valid = all(lower < item <= 1.0 for item in result)
+        else:
+            valid = all(lower <= item <= 1.0 for item in result)
+        if not valid:
+            interval = "(0, 1]" if positive else "[0, 1]"
+            raise ValueError(f"{name} values must be inside {interval}")
+        return result
 
     def submit(self, frame: FramePacket) -> bool:
         with self._lock:
@@ -1398,13 +1777,27 @@ class IconRecorderSession:
 
     def request_stop(self) -> None:
         self._stop_event.set()
+        segmentation_session = self.segmentation_session
+        if segmentation_session is not None:
+            try:
+                segmentation_session.request_stop()
+            except Exception:
+                pass
 
     def join(self, timeout: float | None = None) -> bool:
+        started = time.monotonic()
         thread = self._thread
-        if thread is None:
+        if thread is not None:
+            thread.join(timeout)
+            if thread.is_alive():
+                return False
+        segmentation_session = self.segmentation_session
+        if segmentation_session is None:
             return True
-        thread.join(timeout)
-        return not thread.is_alive()
+        remaining = None
+        if timeout is not None:
+            remaining = max(0.0, timeout - (time.monotonic() - started))
+        return segmentation_session.join(remaining)
 
     def _run(self) -> None:
         try:
@@ -1413,6 +1806,11 @@ class IconRecorderSession:
                     frame = self._frames.get(timeout=0.05)
                 except queue.Empty:
                     continue
+                gate_decision = self._observe_change_gate_frame(frame)
+                self._maybe_match_stable_templates(frame, gate_decision)
+                if self.change_gate is not None:
+                    if gate_decision is None or not gate_decision.should_scan:
+                        continue
                 try:
                     result = self.detector.observe_frame(frame)
                 except IconResourceLimitError as exc:
@@ -1427,15 +1825,17 @@ class IconRecorderSession:
                 )
                 if not has_confirmation:
                     continue
+                if self.change_gate is not None:
+                    with self._lock:
+                        self._pending_detector_hit = True
+                        self._gate_detector_hits += 1
                 if self._confirmation_batch_is_in_cooldown():
                     self._skip_confirmation_batch_for_cooldown(result)
                     continue
                 with self._lock:
                     persisted_before = self._persisted_candidates
                 if result.candidates:
-                    outcome = self._process_materialized_batch(
-                        result.candidates
-                    )
+                    outcome = self._process_materialized_batch(result.candidates)
                     if outcome is not None:
                         self._resolve_detector_batch(result.candidates)
                     else:
@@ -1443,9 +1843,7 @@ class IconRecorderSession:
                         self._clear_frame_queue()
                 else:
                     assert result.candidate is not None
-                    outcome = self._process_pending_detector_batch(
-                        result.candidate
-                    )
+                    outcome = self._process_pending_detector_batch(result.candidate)
                 with self._lock:
                     if self._persisted_candidates > persisted_before:
                         self._last_persisted_batch_ns = time.monotonic_ns()
@@ -1473,6 +1871,282 @@ class IconRecorderSession:
             with self._lock:
                 if self._state == "RUNNING":
                     self._state = "STOPPED"
+
+    def _observe_change_gate_frame(
+        self,
+        frame: FramePacket,
+    ) -> IconChangeGateDecision | None:
+        gate = self.change_gate
+        if gate is None:
+            return None
+        if frame.freshness is not Freshness.NEW:
+            with self._lock:
+                self._gate_idle_skips += 1
+                self._analysis_phase = "GATE_IGNORED_NON_NEW"
+            return None
+
+        scope_key = self._gate_frame_scope_key(frame)
+        if scope_key != self._gate_scope_key:
+            gate.reset()
+            self.detector.reset_tracking()
+            self._gate_scope_key = scope_key
+            self._last_gate_sample_ns = 0
+            self._pending_detector_hit = False
+
+        captured_ns = frame.captured_at_monotonic_ns
+        if captured_ns <= self._last_gate_sample_ns:
+            with self._lock:
+                self._gate_idle_skips += 1
+                self._analysis_phase = "GATE_IGNORED_NON_MONOTONIC"
+            return None
+        sample_interval_ns = self.detector.policy.sample_interval_ms * 1_000_000
+        if (
+            self._last_gate_sample_ns
+            and captured_ns - self._last_gate_sample_ns < sample_interval_ns
+        ):
+            with self._lock:
+                self._gate_idle_skips += 1
+                self._analysis_phase = f"GATE_{gate.state.value}"
+            return None
+
+        gray = self._prepare_change_gate_gray(frame, gate)
+        with self._lock:
+            detector_hit = self._pending_detector_hit
+            self._pending_detector_hit = False
+        decision = gate.observe(
+            gray,
+            captured_ns,
+            detector_hit=detector_hit,
+        )
+        self._last_gate_sample_ns = captured_ns
+
+        transition = decision.transition
+        if (
+            transition is not None
+            and transition.current_state is IconChangeGateState.ACTIVE_SCAN
+        ):
+            self.detector.reset_tracking()
+        with self._lock:
+            self._last_gate_decision = decision
+            self._gate_samples += 1
+            if decision.should_scan:
+                self._gate_active_samples += 1
+            else:
+                self._gate_idle_skips += 1
+            if (
+                transition is not None
+                and transition.current_state is IconChangeGateState.ACTIVE_SCAN
+            ):
+                self._gate_wakeups += 1
+                self._change_epoch += 1
+            if decision.reason_code == "ACTIVE_SCAN_TIMEOUT":
+                self._gate_scan_timeouts += 1
+            self._analysis_phase = f"GATE_{decision.state.value}"
+
+        if transition is not None:
+            self._publish_gate_transition(frame, decision)
+        return decision
+
+    @staticmethod
+    def _prepare_change_gate_gray(
+        frame: FramePacket,
+        gate: IconChangeGate,
+    ) -> GrayPixels:
+        policy = gate.policy
+        image = frame_packet_to_image(
+            frame,
+            InputFrameConfiguration(
+                mode=InputResolutionMode.FIT,
+                max_width=policy.analysis_width,
+                max_height=policy.analysis_height,
+                allow_upscale=False,
+            ),
+        )
+        pixels = to_gray(image).pixels
+        expected_shape = (policy.analysis_height, policy.analysis_width)
+        if pixels.shape != expected_shape:
+            pixels = cv2.resize(
+                pixels,
+                (policy.analysis_width, policy.analysis_height),
+                interpolation=(
+                    cv2.INTER_AREA
+                    if pixels.shape[1] >= policy.analysis_width
+                    and pixels.shape[0] >= policy.analysis_height
+                    else cv2.INTER_LINEAR
+                ),
+            )
+        pixels = cv2.GaussianBlur(pixels, (3, 3), 0)
+        return np.ascontiguousarray(pixels, dtype=np.uint8)
+
+    @staticmethod
+    def _gate_frame_scope_key(frame: FramePacket) -> tuple[object, ...]:
+        return (
+            frame.session_id,
+            frame.capture_backend,
+            frame.target_generation,
+            frame.width,
+            frame.height,
+            frame.pixel_format.value,
+            json.dumps(
+                target_to_dict(frame.effective_target),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def _publish_gate_transition(
+        self,
+        frame: FramePacket,
+        decision: IconChangeGateDecision,
+    ) -> None:
+        transition = decision.transition
+        assert transition is not None
+        pair = decision.pair_difference
+        anchor = decision.anchor_difference
+        self._publish_event(
+            IconRecordEvent(
+                status=IconRecordStatus.GATE_TRANSITION,
+                occurred_at_monotonic_ns=frame.captured_at_monotonic_ns,
+                reason_code=transition.reason_code,
+                frame_id=frame.frame_id,
+                details={
+                    "previous_state": transition.previous_state.value,
+                    "current_state": transition.current_state.value,
+                    "pair_changed_ratio": (
+                        None if pair is None else pair.changed_ratio
+                    ),
+                    "pair_mean_difference": (
+                        None if pair is None else pair.mean_difference
+                    ),
+                    "anchor_changed_ratio": (
+                        None if anchor is None else anchor.changed_ratio
+                    ),
+                    "anchor_mean_difference": (
+                        None if anchor is None else anchor.mean_difference
+                    ),
+                    "trigger_reason": (
+                        None
+                        if decision.trigger_reason is None
+                        else decision.trigger_reason.value
+                    ),
+                },
+            )
+        )
+
+    def _maybe_match_stable_templates(
+        self,
+        frame: FramePacket,
+        decision: IconChangeGateDecision | None,
+    ) -> None:
+        matcher = self.template_matcher
+        gate = self.change_gate
+        if matcher is None or gate is None or decision is None:
+            return
+        with self._lock:
+            change_epoch = self._change_epoch
+            matched_epoch = self._matched_epoch
+        if (
+            change_epoch <= 0
+            or matched_epoch >= change_epoch
+            or decision.state is IconChangeGateState.ACTIVE_SCAN
+            or decision.quiet_samples < gate.policy.quiet_consecutive_samples
+        ):
+            return
+
+        scope_resolver = getattr(self.detector, "scope_id_for_frame", None)
+        if not callable(scope_resolver):
+            with self._lock:
+                self._matched_epoch = change_epoch
+            return
+        scope_id = scope_resolver(frame)
+        with self._templates_lock:
+            templates = tuple(
+                template
+                for template in self._templates.values()
+                if template.scope_id == scope_id
+            )
+        if not templates:
+            return
+
+        # Reserve the epoch before the bounded work.  Conversion or matcher
+        # errors become UNKNOWN evidence instead of retrying every quiet frame.
+        with self._lock:
+            if self._matched_epoch >= change_epoch:
+                return
+            self._matched_epoch = change_epoch
+            self._template_match_runs += 1
+        try:
+            frame_rgb = np.ascontiguousarray(
+                to_rgb(frame_packet_to_image(frame)).pixels,
+                dtype=np.uint8,
+            )
+        except Exception as exc:
+            for template in templates:
+                self._publish_template_match(
+                    frame,
+                    scope_id,
+                    template.template_id,
+                    IconTemplateMatchResult(
+                        status=IconPresence.UNKNOWN,
+                        reason_code=(
+                            f"MATCH_FRAME_PREPARATION_FAILED:{type(exc).__name__}"
+                        ),
+                    ),
+                    change_epoch,
+                )
+            return
+
+        for template in templates:
+            try:
+                result = matcher.match(
+                    frame_rgb,
+                    template.template_rgb,
+                    template.recognition_mask,
+                    normalized_center=template.normalized_center,
+                    normalized_size=template.normalized_size,
+                )
+            except Exception as exc:
+                result = IconTemplateMatchResult(
+                    status=IconPresence.UNKNOWN,
+                    reason_code=f"MATCH_EXECUTION_FAILED:{type(exc).__name__}",
+                )
+            self._publish_template_match(
+                frame,
+                scope_id,
+                template.template_id,
+                result,
+                change_epoch,
+            )
+
+    def _publish_template_match(
+        self,
+        frame: FramePacket,
+        scope_id: str,
+        template_id: str,
+        result: IconTemplateMatchResult,
+        change_epoch: int,
+    ) -> None:
+        with self._lock:
+            if result.status is IconPresence.PRESENT:
+                self._template_match_present += 1
+            elif result.status is IconPresence.ABSENT:
+                self._template_match_absent += 1
+            else:
+                self._template_match_unknown += 1
+        self._put_drop_oldest(
+            self.template_matches,
+            IconTemplateVerificationEvent(
+                occurred_at_monotonic_ns=max(
+                    1,
+                    frame.captured_at_monotonic_ns,
+                ),
+                frame_id=frame.frame_id,
+                scope_id=scope_id,
+                template_id=template_id,
+                result=result,
+                change_epoch=change_epoch,
+            ),
+        )
 
     def _process_materialized_batch(
         self,
@@ -1551,6 +2225,7 @@ class IconRecorderSession:
                 artifact=artifact,
             )
             return False
+        self._submit_segmentation(candidate, artifact)
         self._put_latest(self.candidates, candidate)
         with self._lock:
             self._persisted_candidates += 1
@@ -1560,9 +2235,7 @@ class IconRecorderSession:
                 status=IconRecordStatus.RECORDED,
                 occurred_at_monotonic_ns=time.monotonic_ns(),
                 reason_code="FIXED_HUD_CANDIDATE_PERSISTED",
-                frame_id=str(
-                    candidate.source_frame_metadata.get("frame_id") or ""
-                ),
+                frame_id=str(candidate.source_frame_metadata.get("frame_id") or ""),
                 candidate_id=candidate.candidate_id,
                 scope_id=candidate.scope_id,
                 artifact=artifact,
@@ -1572,6 +2245,59 @@ class IconRecorderSession:
             self._mark_limit_reached(candidate)
             return False
         return True
+
+    def _submit_segmentation(
+        self,
+        candidate: IconRecordCandidate,
+        artifact: object,
+    ) -> None:
+        segmentation_session = self.segmentation_session
+        if segmentation_session is None or self._segmentation_disabled:
+            return
+        failure = segmentation_session.failure
+        if failure is not None or not segmentation_session.is_alive:
+            with self._lock:
+                self._segmentation_disabled = True
+            self._publish_event(
+                IconRecordEvent(
+                    status=IconRecordStatus.SEGMENTATION_NOTICE,
+                    occurred_at_monotonic_ns=time.monotonic_ns(),
+                    reason_code="SAM_SESSION_UNAVAILABLE",
+                    frame_id=str(candidate.source_frame_metadata.get("frame_id") or ""),
+                    candidate_id=candidate.candidate_id,
+                    scope_id=candidate.scope_id,
+                    error=str(failure or "SAM session stopped unexpectedly"),
+                )
+            )
+            return
+        try:
+            request = segmentation_session.submit(candidate, artifact)
+        except Exception as exc:
+            with self._lock:
+                self._segmentation_disabled = True
+            self._publish_event(
+                IconRecordEvent(
+                    status=IconRecordStatus.SEGMENTATION_NOTICE,
+                    occurred_at_monotonic_ns=time.monotonic_ns(),
+                    reason_code="SAM_SUBMIT_FAILED",
+                    frame_id=str(candidate.source_frame_metadata.get("frame_id") or ""),
+                    candidate_id=candidate.candidate_id,
+                    scope_id=candidate.scope_id,
+                    error=str(exc),
+                )
+            )
+            return
+        if request is None:
+            self._publish_event(
+                IconRecordEvent(
+                    status=IconRecordStatus.SEGMENTATION_NOTICE,
+                    occurred_at_monotonic_ns=time.monotonic_ns(),
+                    reason_code="SAM_SUBMIT_SKIPPED",
+                    frame_id=str(candidate.source_frame_metadata.get("frame_id") or ""),
+                    candidate_id=candidate.candidate_id,
+                    scope_id=candidate.scope_id,
+                )
+            )
 
     def _persist(self, candidate: IconRecordCandidate):
         # The production store is atomic and hard-bounded by crop/PNG size.
@@ -1659,9 +2385,7 @@ class IconRecorderSession:
                 status=IconRecordStatus.RESOURCE_LIMIT_REACHED,
                 occurred_at_monotonic_ns=time.monotonic_ns(),
                 reason_code=reason_code,
-                frame_id=str(
-                    candidate.source_frame_metadata.get("frame_id") or ""
-                ),
+                frame_id=str(candidate.source_frame_metadata.get("frame_id") or ""),
                 candidate_id=candidate.candidate_id,
                 scope_id=candidate.scope_id,
                 artifact=artifact,
@@ -1710,9 +2434,7 @@ class IconRecorderSession:
         )
 
     def _confirmation_batch_is_in_cooldown(self) -> bool:
-        interval_ns = (
-            self.catalog.policy.minimum_batch_interval_ms * 1_000_000
-        )
+        interval_ns = self.catalog.policy.minimum_batch_interval_ms * 1_000_000
         if interval_ns <= 0:
             return False
         with self._lock:
@@ -1726,11 +2448,7 @@ class IconRecorderSession:
         self,
         result: IconDetectorResult,
     ) -> None:
-        candidate = (
-            result.candidates[0]
-            if result.candidates
-            else result.candidate
-        )
+        candidate = result.candidates[0] if result.candidates else result.candidate
         assert candidate is not None
         if result.candidates:
             self._resolve_detector_batch(result.candidates)
@@ -1748,9 +2466,7 @@ class IconRecorderSession:
                 status=IconRecordStatus.COOLDOWN_SKIPPED,
                 occurred_at_monotonic_ns=time.monotonic_ns(),
                 reason_code="HUD_CANDIDATE_BATCH_WRITE_COOLDOWN",
-                frame_id=str(
-                    candidate.source_frame_metadata.get("frame_id") or ""
-                ),
+                frame_id=str(candidate.source_frame_metadata.get("frame_id") or ""),
                 candidate_id=candidate.candidate_id,
                 scope_id=candidate.scope_id,
             )
@@ -1837,5 +2553,6 @@ __all__ = [
     "IconRecorderPolicy",
     "IconRecorderSession",
     "IconRecorderStats",
+    "IconTemplateVerificationEvent",
     "IconWindowEvidence",
 ]

@@ -18,6 +18,7 @@ from .contracts import (
 from .icon_recorder import IconRecordEvent, IconRecordStatus
 from .keyframes import DetectorResult, KeyframeCandidate, StableKeyframeDetector
 from .ocr_semantics import OcrSemanticState
+from .ui_anchor_session import UiAnchorEvent, UiAnchorEventStatus
 
 
 class KeyframeWriter(Protocol):
@@ -75,6 +76,31 @@ class IconRecorderGate(Protocol):
     def join(self, timeout: float | None = None) -> bool: ...
 
 
+class UiAnchorDiscoveryGate(Protocol):
+    events: queue.Queue[UiAnchorEvent]
+    candidates: queue.Queue[object]
+    previews: queue.Queue[object]
+
+    @property
+    def is_alive(self) -> bool: ...
+
+    @property
+    def failure(self) -> Exception | None: ...
+
+    @property
+    def state(self): ...
+
+    def stats(self): ...
+
+    def start(self) -> None: ...
+
+    def submit(self, frame: FramePacket) -> bool: ...
+
+    def request_stop(self) -> None: ...
+
+    def join(self, timeout: float | None = None) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class KeyframeSessionStats:
     processed_frames: int = 0
@@ -96,7 +122,52 @@ class KeyframeSessionStats:
     icon_cooldown_batches: int = 0
     icon_persisted_candidates: int = 0
     icon_max_unique_candidates: int | None = None
+    icon_gate_samples: int = 0
+    icon_gate_idle_skips: int = 0
+    icon_gate_wakeups: int = 0
+    icon_gate_active_samples: int = 0
+    icon_gate_scan_timeouts: int = 0
+    icon_gate_detector_hits: int = 0
+    icon_gate_state: str = "DISABLED"
+    icon_gate_pair_changed_ratio: float | None = None
+    icon_gate_pair_mean_difference: float | None = None
+    icon_gate_anchor_changed_ratio: float | None = None
+    icon_gate_anchor_mean_difference: float | None = None
+    icon_segmentation_submitted: int = 0
+    icon_segmentation_superseded: int = 0
+    icon_segmentation_succeeded: int = 0
+    icon_segmentation_unavailable: int = 0
+    icon_segmentation_failed: int = 0
+    icon_segmentation_cancelled: int = 0
+    icon_segmentation_unknown: int = 0
+    icon_registered_templates: int = 0
+    icon_template_match_runs: int = 0
+    icon_template_match_present: int = 0
+    icon_template_match_absent: int = 0
+    icon_template_match_unknown: int = 0
     icon_errors: int = 0
+    ui_anchor_submitted_frames: int = 0
+    ui_anchor_dropped_frames: int = 0
+    ui_anchor_ignored_frames: int = 0
+    ui_anchor_analyzed_samples: int = 0
+    ui_anchor_motion_qualified_samples: int = 0
+    ui_anchor_eligible_observations: int = 0
+    ui_anchor_motion_episodes: int = 0
+    ui_anchor_direction_bins: int = 0
+    ui_anchor_maximum_support: int = 0
+    ui_anchor_maximum_translucent_support: int = 0
+    ui_anchor_support_target: int = 50
+    ui_anchor_progress_regions: int = 0
+    ui_anchor_refining_regions: int = 0
+    ui_anchor_promoted_candidates: int = 0
+    ui_anchor_persisted_candidates: int = 0
+    ui_anchor_last_reason_code: str = "DISABLED"
+    ui_anchor_changed_ratio: float = 0.0
+    ui_anchor_mean_difference: float = 0.0
+    ui_anchor_flow_model_inlier_ratio: float = 0.0
+    ui_anchor_moving_flow_perimeter_sides: int = 0
+    ui_anchor_strong_transition: bool = False
+    ui_anchor_errors: int = 0
 
 
 class KeyframeDetectionSession:
@@ -111,6 +182,7 @@ class KeyframeDetectionSession:
         writer: KeyframeWriter | None = None,
         ocr_session: CandidateOcrGate | None = None,
         icon_recorder: IconRecorderGate | None = None,
+        ui_anchor_discovery: UiAnchorDiscoveryGate | None = None,
         source_alive: Callable[[], bool] | None = None,
         event_queue_size: int = 64,
         status_queue_size: int = 32,
@@ -126,6 +198,7 @@ class KeyframeDetectionSession:
         self.writer = writer
         self.ocr_session = ocr_session
         self.icon_recorder = icon_recorder
+        self.ui_anchor_discovery = ui_anchor_discovery
         self.source_alive = source_alive or (lambda: False)
         self.preview_frames: queue.Queue[FramePacket] = queue.Queue(maxsize=1)
         self.keyframes: queue.Queue[FramePacket] = queue.Queue(maxsize=1)
@@ -138,6 +211,48 @@ class KeyframeDetectionSession:
         self.icon_candidates: queue.Queue[object] = (
             icon_recorder.candidates
             if icon_recorder is not None
+            else queue.Queue(maxsize=1)
+        )
+        self.icon_segmentations: queue.Queue[object] = (
+            getattr(icon_recorder, "segmentations")
+            if icon_recorder is not None
+            and isinstance(getattr(icon_recorder, "segmentations", None), queue.Queue)
+            else queue.Queue(maxsize=1)
+        )
+        self.icon_template_matches: queue.Queue[object] = (
+            getattr(icon_recorder, "template_matches")
+            if icon_recorder is not None
+            and isinstance(
+                getattr(icon_recorder, "template_matches", None),
+                queue.Queue,
+            )
+            else queue.Queue(maxsize=1)
+        )
+        self.ui_anchor_events: queue.Queue[UiAnchorEvent] = (
+            ui_anchor_discovery.events
+            if ui_anchor_discovery is not None
+            and isinstance(
+                getattr(ui_anchor_discovery, "events", None),
+                queue.Queue,
+            )
+            else queue.Queue(maxsize=1)
+        )
+        self.ui_anchor_candidates: queue.Queue[object] = (
+            ui_anchor_discovery.candidates
+            if ui_anchor_discovery is not None
+            and isinstance(
+                getattr(ui_anchor_discovery, "candidates", None),
+                queue.Queue,
+            )
+            else queue.Queue(maxsize=1)
+        )
+        self.ui_anchor_previews: queue.Queue[object] = (
+            ui_anchor_discovery.previews
+            if ui_anchor_discovery is not None
+            and isinstance(
+                getattr(ui_anchor_discovery, "previews", None),
+                queue.Queue,
+            )
             else queue.Queue(maxsize=1)
         )
         self.capture_statuses: queue.Queue[object] = queue.Queue(
@@ -159,18 +274,23 @@ class KeyframeDetectionSession:
         self._icon_disabled = False
         self._icon_submit_failed = False
         self._icon_local_errors = 0
+        self._ui_anchor_disabled = False
+        self._ui_anchor_submit_failed = False
+        self._ui_anchor_submit_closed = False
+        self._ui_anchor_local_errors = 0
 
     @property
     def is_alive(self) -> bool:
         thread = self._thread
         thread_alive = thread is not None and thread.is_alive()
-        ocr_alive = bool(
-            self.ocr_session is not None and self.ocr_session.is_alive
-        )
+        ocr_alive = bool(self.ocr_session is not None and self.ocr_session.is_alive)
         icon_alive = bool(
             self.icon_recorder is not None and self.icon_recorder.is_alive
         )
-        return thread_alive or ocr_alive or icon_alive
+        ui_anchor_alive = bool(
+            self.ui_anchor_discovery is not None and self.ui_anchor_discovery.is_alive
+        )
+        return thread_alive or ocr_alive or icon_alive or ui_anchor_alive
 
     @property
     def failure(self) -> Exception | None:
@@ -184,6 +304,7 @@ class KeyframeDetectionSession:
         with self._stats_lock:
             stats = self._stats
             icon_local_errors = self._icon_local_errors
+            ui_anchor_local_errors = self._ui_anchor_local_errors
         ocr_session = self.ocr_session
         if ocr_session is not None:
             ocr_stats = ocr_session.stats()
@@ -191,12 +312,9 @@ class KeyframeDetectionSession:
                 stats,
                 ocr_submitted=int(getattr(ocr_stats, "submitted", 0)),
                 ocr_cache_hits=int(getattr(ocr_stats, "cache_hits", 0)),
-                ocr_semantic_matches=int(
-                    getattr(ocr_stats, "semantic_matches", 0)
-                ),
+                ocr_semantic_matches=int(getattr(ocr_stats, "semantic_matches", 0)),
                 ocr_fallbacks=(
-                    int(getattr(ocr_stats, "fallbacks", 0))
-                    + self._ocr_local_fallbacks
+                    int(getattr(ocr_stats, "fallbacks", 0)) + self._ocr_local_fallbacks
                 ),
             )
         icon_recorder = self.icon_recorder
@@ -204,16 +322,10 @@ class KeyframeDetectionSession:
             icon_stats = icon_recorder.stats()
             stats = replace(
                 stats,
-                icon_submitted_frames=int(
-                    getattr(icon_stats, "submitted_frames", 0)
-                ),
+                icon_submitted_frames=int(getattr(icon_stats, "submitted_frames", 0)),
                 icon_dropped_frames=int(getattr(icon_stats, "dropped_frames", 0)),
-                icon_analyzed_samples=int(
-                    getattr(icon_stats, "analyzed_samples", 0)
-                ),
-                icon_qualified_windows=int(
-                    getattr(icon_stats, "qualified_windows", 0)
-                ),
+                icon_analyzed_samples=int(getattr(icon_stats, "analyzed_samples", 0)),
+                icon_qualified_windows=int(getattr(icon_stats, "qualified_windows", 0)),
                 icon_confirmed_candidates=int(
                     getattr(icon_stats, "confirmed_candidates", 0)
                 ),
@@ -223,9 +335,7 @@ class KeyframeDetectionSession:
                 icon_near_visual_duplicates=int(
                     getattr(icon_stats, "near_visual_duplicates", 0)
                 ),
-                icon_cooldown_batches=int(
-                    getattr(icon_stats, "cooldown_batches", 0)
-                ),
+                icon_cooldown_batches=int(getattr(icon_stats, "cooldown_batches", 0)),
                 icon_persisted_candidates=int(
                     getattr(icon_stats, "persisted_candidates", 0)
                 ),
@@ -234,8 +344,151 @@ class KeyframeDetectionSession:
                     "max_unique_candidates",
                     None,
                 ),
-                icon_errors=(
-                    int(getattr(icon_stats, "errors", 0)) + icon_local_errors
+                icon_gate_samples=int(getattr(icon_stats, "gate_samples", 0)),
+                icon_gate_idle_skips=int(getattr(icon_stats, "gate_idle_skips", 0)),
+                icon_gate_wakeups=int(getattr(icon_stats, "gate_wakeups", 0)),
+                icon_gate_active_samples=int(
+                    getattr(icon_stats, "gate_active_samples", 0)
+                ),
+                icon_gate_scan_timeouts=int(
+                    getattr(icon_stats, "gate_scan_timeouts", 0)
+                ),
+                icon_gate_detector_hits=int(
+                    getattr(icon_stats, "gate_detector_hits", 0)
+                ),
+                icon_gate_state=str(getattr(icon_stats, "gate_state", "DISABLED")),
+                icon_gate_pair_changed_ratio=getattr(
+                    icon_stats,
+                    "gate_pair_changed_ratio",
+                    None,
+                ),
+                icon_gate_pair_mean_difference=getattr(
+                    icon_stats,
+                    "gate_pair_mean_difference",
+                    None,
+                ),
+                icon_gate_anchor_changed_ratio=getattr(
+                    icon_stats,
+                    "gate_anchor_changed_ratio",
+                    None,
+                ),
+                icon_gate_anchor_mean_difference=getattr(
+                    icon_stats,
+                    "gate_anchor_mean_difference",
+                    None,
+                ),
+                icon_segmentation_submitted=int(
+                    getattr(icon_stats, "segmentation_submitted", 0)
+                ),
+                icon_segmentation_superseded=int(
+                    getattr(icon_stats, "segmentation_superseded", 0)
+                ),
+                icon_segmentation_succeeded=int(
+                    getattr(icon_stats, "segmentation_succeeded", 0)
+                ),
+                icon_segmentation_unavailable=int(
+                    getattr(icon_stats, "segmentation_unavailable", 0)
+                ),
+                icon_segmentation_failed=int(
+                    getattr(icon_stats, "segmentation_failed", 0)
+                ),
+                icon_segmentation_cancelled=int(
+                    getattr(icon_stats, "segmentation_cancelled", 0)
+                ),
+                icon_segmentation_unknown=int(
+                    getattr(icon_stats, "segmentation_unknown", 0)
+                ),
+                icon_registered_templates=int(
+                    getattr(icon_stats, "registered_templates", 0)
+                ),
+                icon_template_match_runs=int(
+                    getattr(icon_stats, "template_match_runs", 0)
+                ),
+                icon_template_match_present=int(
+                    getattr(icon_stats, "template_match_present", 0)
+                ),
+                icon_template_match_absent=int(
+                    getattr(icon_stats, "template_match_absent", 0)
+                ),
+                icon_template_match_unknown=int(
+                    getattr(icon_stats, "template_match_unknown", 0)
+                ),
+                icon_errors=(int(getattr(icon_stats, "errors", 0)) + icon_local_errors),
+            )
+        ui_anchor_discovery = self.ui_anchor_discovery
+        if ui_anchor_discovery is not None:
+            ui_anchor_stats = ui_anchor_discovery.stats()
+            stats = replace(
+                stats,
+                ui_anchor_submitted_frames=int(
+                    getattr(ui_anchor_stats, "submitted_frames", 0)
+                ),
+                ui_anchor_dropped_frames=int(
+                    getattr(ui_anchor_stats, "dropped_frames", 0)
+                ),
+                ui_anchor_ignored_frames=int(
+                    getattr(ui_anchor_stats, "ignored_frames", 0)
+                ),
+                ui_anchor_analyzed_samples=int(
+                    getattr(ui_anchor_stats, "analyzed_samples", 0)
+                ),
+                ui_anchor_motion_qualified_samples=int(
+                    getattr(ui_anchor_stats, "motion_qualified_samples", 0)
+                ),
+                ui_anchor_eligible_observations=int(
+                    getattr(ui_anchor_stats, "eligible_observations", 0)
+                ),
+                ui_anchor_motion_episodes=int(
+                    getattr(ui_anchor_stats, "motion_episode_count", 0)
+                ),
+                ui_anchor_direction_bins=int(
+                    getattr(ui_anchor_stats, "observed_direction_bins", 0)
+                ),
+                ui_anchor_maximum_support=int(
+                    getattr(ui_anchor_stats, "maximum_support", 0)
+                ),
+                ui_anchor_maximum_translucent_support=int(
+                    getattr(
+                        ui_anchor_stats,
+                        "maximum_translucent_support",
+                        0,
+                    )
+                ),
+                ui_anchor_support_target=int(
+                    getattr(ui_anchor_stats, "support_target", 50)
+                ),
+                ui_anchor_progress_regions=int(
+                    getattr(ui_anchor_stats, "progress_regions", 0)
+                ),
+                ui_anchor_refining_regions=int(
+                    getattr(ui_anchor_stats, "refining_regions", 0)
+                ),
+                ui_anchor_promoted_candidates=int(
+                    getattr(ui_anchor_stats, "promoted_candidates", 0)
+                ),
+                ui_anchor_persisted_candidates=int(
+                    getattr(ui_anchor_stats, "persisted_candidates", 0)
+                ),
+                ui_anchor_last_reason_code=str(
+                    getattr(ui_anchor_stats, "last_reason_code", "WAITING_FRAME")
+                ),
+                ui_anchor_changed_ratio=float(
+                    getattr(ui_anchor_stats, "changed_ratio", 0.0)
+                ),
+                ui_anchor_mean_difference=float(
+                    getattr(ui_anchor_stats, "mean_difference", 0.0)
+                ),
+                ui_anchor_flow_model_inlier_ratio=float(
+                    getattr(ui_anchor_stats, "flow_model_inlier_ratio", 0.0)
+                ),
+                ui_anchor_moving_flow_perimeter_sides=int(
+                    getattr(ui_anchor_stats, "moving_flow_perimeter_sides", 0)
+                ),
+                ui_anchor_strong_transition=bool(
+                    getattr(ui_anchor_stats, "strong_transition", False)
+                ),
+                ui_anchor_errors=(
+                    int(getattr(ui_anchor_stats, "errors", 0)) + ui_anchor_local_errors
                 ),
             )
         return stats
@@ -255,6 +508,38 @@ class KeyframeDetectionSession:
             return "DEGRADED"
         state = self.icon_recorder.state
         return str(getattr(state, "value", state))
+
+    @property
+    def icon_segmentation_state(self) -> str:
+        if self.icon_recorder is None:
+            return "DISABLED"
+        stats = self.icon_recorder.stats()
+        return str(getattr(stats, "segmentation_state", "DISABLED"))
+
+    @property
+    def ui_anchor_state(self) -> str:
+        if self.ui_anchor_discovery is None:
+            return "DISABLED"
+        if self._ui_anchor_disabled or self._ui_anchor_submit_failed:
+            return "DEGRADED"
+        state = self.ui_anchor_discovery.state
+        return str(getattr(state, "value", state))
+
+    @property
+    def ui_anchor_scope_id(self) -> str | None:
+        if self.ui_anchor_discovery is None:
+            return None
+        scope_id = getattr(self.ui_anchor_discovery, "scope_id", None)
+        return None if scope_id is None else str(scope_id)
+
+    def register_icon_template(self, template: object) -> str | None:
+        recorder = self.icon_recorder
+        registrar = (
+            None if recorder is None else getattr(recorder, "register_template", None)
+        )
+        if not callable(registrar):
+            raise RuntimeError("icon template matcher is not available")
+        return registrar(template)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -278,6 +563,23 @@ class KeyframeDetectionSession:
                     self.icon_recorder.join(timeout=1.0)
                 except Exception:
                     pass
+        ui_anchor_started = False
+        if self.ui_anchor_discovery is not None:
+            try:
+                self.ui_anchor_discovery.start()
+                ui_anchor_started = True
+            except Exception as exc:
+                self._ui_anchor_disabled = True
+                self._publish_ui_anchor_error(
+                    "UI_ANCHOR_DISCOVERY_START_FAILED",
+                    exc,
+                    frame_id=None,
+                )
+                try:
+                    self.ui_anchor_discovery.request_stop()
+                    self.ui_anchor_discovery.join(timeout=1.0)
+                except Exception:
+                    pass
         try:
             if self.ocr_session is not None:
                 self.ocr_session.start()
@@ -291,6 +593,8 @@ class KeyframeDetectionSession:
             components = [self.ocr_session]
             if icon_started:
                 components.append(self.icon_recorder)
+            if ui_anchor_started:
+                components.append(self.ui_anchor_discovery)
             self._stop_components(components, timeout=1.0)
             raise
 
@@ -308,7 +612,11 @@ class KeyframeDetectionSession:
             thread.join(timeout)
             if thread.is_alive():
                 return False
-        for component in (self.ocr_session, self.icon_recorder):
+        for component in (
+            self.ocr_session,
+            self.icon_recorder,
+            self.ui_anchor_discovery,
+        ):
             if component is None or not component.is_alive:
                 continue
             remaining = None
@@ -337,7 +645,11 @@ class KeyframeDetectionSession:
             )
         finally:
             self._stop_components(
-                (self.ocr_session, self.icon_recorder),
+                (
+                    self.ocr_session,
+                    self.icon_recorder,
+                    self.ui_anchor_discovery,
+                ),
                 timeout=2.0,
             )
 
@@ -424,12 +736,12 @@ class KeyframeDetectionSession:
                 processed_frames=self._stats.processed_frames + 1,
             )
         self._submit_icon_frame(frame)
+        self._submit_ui_anchor_frame(frame)
         if self._pending_ocr_result is not None:
             current = self._deferred_frame
             if (
                 current is None
-                or frame.captured_at_monotonic_ns
-                >= current.captured_at_monotonic_ns
+                or frame.captured_at_monotonic_ns >= current.captured_at_monotonic_ns
             ):
                 self._deferred_frame = frame
             return
@@ -456,6 +768,30 @@ class KeyframeDetectionSession:
                 frame_id=frame.frame_id,
             )
 
+    def _submit_ui_anchor_frame(self, frame: FramePacket) -> None:
+        if (
+            self.ui_anchor_discovery is None
+            or self._ui_anchor_disabled
+            or self._ui_anchor_submit_failed
+            or self._ui_anchor_submit_closed
+        ):
+            return
+        try:
+            accepted = self.ui_anchor_discovery.submit(frame)
+            if accepted is False:
+                self._ui_anchor_submit_closed = True
+        except Exception as exc:
+            self._ui_anchor_submit_failed = True
+            try:
+                self.ui_anchor_discovery.request_stop()
+            except Exception:
+                pass
+            self._publish_ui_anchor_error(
+                "UI_ANCHOR_DISCOVERY_SUBMIT_FAILED",
+                exc,
+                frame_id=frame.frame_id,
+            )
+
     def _publish_icon_error(
         self,
         reason_code: str,
@@ -469,6 +805,26 @@ class KeyframeDetectionSession:
             self.icon_events,
             IconRecordEvent(
                 status=IconRecordStatus.ERROR,
+                occurred_at_monotonic_ns=time.monotonic_ns(),
+                reason_code=reason_code,
+                frame_id=frame_id,
+                error=str(error),
+            ),
+        )
+
+    def _publish_ui_anchor_error(
+        self,
+        reason_code: str,
+        error: Exception,
+        *,
+        frame_id: str | None,
+    ) -> None:
+        with self._stats_lock:
+            self._ui_anchor_local_errors += 1
+        self._put_drop_oldest(
+            self.ui_anchor_events,
+            UiAnchorEvent(
+                status=UiAnchorEventStatus.ERROR,
                 occurred_at_monotonic_ns=time.monotonic_ns(),
                 reason_code=reason_code,
                 frame_id=frame_id,
@@ -584,11 +940,7 @@ class KeyframeDetectionSession:
             self.detector.commit_new(candidate)
 
         if self.ocr_session is not None and persistence_error is None:
-            fingerprint = (
-                None
-                if ocr_event is None
-                else ocr_event.candidate_fingerprint
-            )
+            fingerprint = None if ocr_event is None else ocr_event.candidate_fingerprint
             self.ocr_session.remember_canonical(candidate, fingerprint)
 
         event = replace(
@@ -607,15 +959,9 @@ class KeyframeDetectionSession:
                 )
             ),
             visual_band=candidate.visual_band,
-            ocr_decision=(
-                None if ocr_event is None else ocr_event.decision.value
-            ),
-            ocr_reason_code=(
-                None if ocr_event is None else ocr_event.reason_code
-            ),
-            ocr_error=ocr_error or (
-                None if ocr_event is None else ocr_event.error
-            ),
+            ocr_decision=(None if ocr_event is None else ocr_event.decision.value),
+            ocr_reason_code=(None if ocr_event is None else ocr_event.reason_code),
+            ocr_error=ocr_error or (None if ocr_event is None else ocr_event.error),
             artifact=artifact,
             persistence_error=persistence_error,
         )
@@ -670,10 +1016,7 @@ class KeyframeDetectionSession:
                     pending,
                     reason_code="OCR_UNKNOWN_FALLBACK",
                     ocr_event=event,
-                    ocr_error=(
-                        event.error
-                        or f"OCR inconclusive: {event.reason_code}"
-                    ),
+                    ocr_error=(event.error or f"OCR inconclusive: {event.reason_code}"),
                 )
             self._resume_deferred_frame()
         return worked
@@ -721,11 +1064,7 @@ class KeyframeDetectionSession:
         quiescence = self._deferred_quiescence
         self._deferred_frame = None
         self._deferred_quiescence = None
-        if (
-            frame is None
-            or self.stop_event.is_set()
-            or self.detector.is_terminal
-        ):
+        if frame is None or self.stop_event.is_set() or self.detector.is_terminal:
             return
         self._analyze_frame(frame)
         if quiescence is not None:

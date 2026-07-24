@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -63,6 +64,7 @@ from experiments.capture_runtime.session import CaptureSession
 from .advanced_settings import AdvancedSettingsDialog, AdvancedTraceSettings
 from .candidate_ocr import CandidateOcrSession
 from .contracts import KeyframeEvent, KeyframePolicy, KeyframeStatus
+from .icon_change_gate import IconChangeGate, IconChangeGatePolicy
 from .icon_catalog import IconCatalogPolicy
 from .icon_recorder import (
     FixedHudIconDetector,
@@ -71,16 +73,36 @@ from .icon_recorder import (
     IconRecorderPolicy,
     IconRecorderSession,
 )
+from .icon_segmentation import (
+    IconSegmentationQaStatus,
+    IconSegmentationSession,
+    IconSegmentationStatus,
+)
 from .icon_store import IconCandidateStore
+from .icon_template_matcher import (
+    IconTemplateMatchPolicy,
+    PositionConstrainedIconMatcher,
+)
+from .icon_templates import IconTemplateStore
 from .keyframe_session import KeyframeDetectionSession
 from .keyframe_store import KeyframeStore
 from .keyframes import StableKeyframeDetector
 from .ocr_semantics import OcrSemanticPolicy
+from .ui_anchor_discovery import (
+    ScreenLockedRegionAccumulator,
+    UiAnchorDiscoveryPolicy,
+)
+from .ui_anchor_session import (
+    UiAnchorDiscoverySession,
+    UiAnchorEventStatus,
+)
+from .ui_anchor_store import UiAnchorCandidateStore, UiAnchorStorePolicy
 
 
 BackendProbe = Callable[[], tuple[object, ...]]
 WindowProvider = Callable[..., list[WindowInfo]]
 SessionFactory = Callable[..., object]
+ExportPathProvider = Callable[[QWidget, Path], str]
 _ACTIVE_WINDOWS: set[QMainWindow] = set()
 
 
@@ -94,6 +116,27 @@ def _default_ocr_session_factory(**kwargs):
 
 def _default_icon_recorder_factory(**kwargs):
     return IconRecorderSession(**kwargs)
+
+
+def _default_icon_segmentation_factory(**kwargs):
+    return IconSegmentationSession(**kwargs)
+
+
+def _default_ui_anchor_session_factory(**kwargs):
+    return UiAnchorDiscoverySession(**kwargs)
+
+
+def _default_ui_anchor_export_path_provider(
+    parent: QWidget,
+    default_path: Path,
+) -> str:
+    selected, _selected_filter = QFileDialog.getSaveFileName(
+        parent,
+        "导出当前 UI 锚点掩码可视化",
+        str(default_path),
+        "PNG 图像 (*.png)",
+    )
+    return selected
 
 
 def _default_output_root() -> Path:
@@ -112,6 +155,15 @@ class MinimalTraceWindow(QMainWindow):
         keyframe_session_factory: SessionFactory = KeyframeDetectionSession,
         ocr_session_factory: SessionFactory = _default_ocr_session_factory,
         icon_recorder_factory: SessionFactory = _default_icon_recorder_factory,
+        icon_segmentation_factory: SessionFactory = (
+            _default_icon_segmentation_factory
+        ),
+        ui_anchor_session_factory: SessionFactory = (
+            _default_ui_anchor_session_factory
+        ),
+        ui_anchor_export_path_provider: ExportPathProvider = (
+            _default_ui_anchor_export_path_provider
+        ),
     ) -> None:
         super().__init__()
         self.setWindowTitle("WorldTrace 最小闭环 · 稳定关键帧")
@@ -122,6 +174,9 @@ class MinimalTraceWindow(QMainWindow):
         self._keyframe_session_factory = keyframe_session_factory
         self._ocr_session_factory = ocr_session_factory
         self._icon_recorder_factory = icon_recorder_factory
+        self._icon_segmentation_factory = icon_segmentation_factory
+        self._ui_anchor_session_factory = ui_anchor_session_factory
+        self._ui_anchor_export_path_provider = ui_anchor_export_path_provider
         self._capabilities = {
             getattr(capability, "backend_id"): capability
             for capability in backend_probe()
@@ -136,6 +191,14 @@ class MinimalTraceWindow(QMainWindow):
         self._live_image: QImage | None = None
         self._keyframe_image: QImage | None = None
         self._icon_image: QImage | None = None
+        self._ui_anchor_image: QImage | None = None
+        self._ui_anchor_preview_frame_id: str | None = None
+        self._ui_anchor_preview_scope_id: str | None = None
+        self._active_ui_anchor_scope_id: str | None = None
+        self._pending_icon_segmentation_event = None
+        self._last_icon_segmentation_sequence = 0
+        self._icon_sam_detail: str | None = None
+        self._icon_template_store = None
         self._last_live_preview_ns = 0
         self._output_root = Path(output_root or _default_output_root()).resolve()
         self._advanced_settings = AdvancedTraceSettings()
@@ -229,20 +292,31 @@ class MinimalTraceWindow(QMainWindow):
         persistence_layout = QGridLayout(persistence_group)
         self.persist_check = QCheckBox("仅保存稳定且会话内未重复的关键帧")
         self.persist_check.setChecked(True)
-        self.icon_record_check = QCheckBox(
-            "固定 HUD 候选记录（实验）"
-        )
+        self.icon_record_check = QCheckBox("固定 HUD 候选记录（实验）")
         self.icon_record_check.setChecked(False)
         self.icon_record_check.setToolTip(
-            "仅在大范围背景轨迹持续移动时，记录屏幕坐标不动的视觉候选；"
+            "先以 320×180 双帧差只在大变化后打开有界 CV 扫描，再在"
+            "大范围背景轨迹持续移动时记录屏幕坐标不动的视觉候选；"
             "确认后按详细参数中的数量和去重策略保存原分辨率 crop.png "
-            "与点位 metadata.json。"
-            "它不是语义图标识别，也不参与 OCR 或关键帧去重。"
+            "与点位 metadata.json。可选 SAM 掩码仍需人工接受后才成为"
+            "临时模板；它不是语义图标识别，也不参与 OCR 或关键帧去重。"
+        )
+        self.ui_anchor_check = QCheckBox("屏幕固定 UI 锚点发现（实验）")
+        self.ui_anchor_check.setChecked(True)
+        self.ui_anchor_check.setToolTip(
+            "只在画面差异与一致光流模型共同证明世界背景运动时，"
+            "且移动模型覆盖足够的画布边侧后，才累计屏幕坐标固定的"
+            "稳定像素与半透明固定形状；强变化不能单独放行。"
+            "达到详细参数设定的有效支持目标（默认 50 次）后，可在"
+            "原有种子掩码附近继续做有界增量补充，结束后只登记一次 "
+            "PROVISIONAL UI 锚点候选；"
+            "它不调用 SAM、不识别图标，也不宣布当前 UI 状态。"
         )
         self.output_edit = QLineEdit(str(self._output_root))
         self.output_browse_button = QPushButton("选择目录")
-        persistence_layout.addWidget(self.persist_check, 0, 0, 1, 3)
-        persistence_layout.addWidget(self.icon_record_check, 0, 3, 1, 3)
+        persistence_layout.addWidget(self.persist_check, 0, 0, 1, 2)
+        persistence_layout.addWidget(self.ui_anchor_check, 0, 2, 1, 2)
+        persistence_layout.addWidget(self.icon_record_check, 0, 4, 1, 2)
         persistence_layout.addWidget(QLabel("输出根目录"), 1, 0)
         persistence_layout.addWidget(self.output_edit, 1, 1, 1, 4)
         persistence_layout.addWidget(self.output_browse_button, 1, 5)
@@ -250,7 +324,9 @@ class MinimalTraceWindow(QMainWindow):
 
         action_row = QHBoxLayout()
         self.mode_hint = QLabel(
-            "采集→关键帧/OCR；可选固定 HUD 旁路→点位轨迹→去重裁剪；普通帧不落盘"
+            "采集→关键帧/OCR；UI锚点旁路→世界运动→固定区域累计→"
+            "可选掩码补充；"
+            "图标/SAM为独立旁路；普通帧不落盘"
         )
         self.mode_hint.setStyleSheet("color: #60656f;")
         self.start_button = QPushButton("开始最小闭环")
@@ -275,12 +351,56 @@ class MinimalTraceWindow(QMainWindow):
             "最近接受关键帧",
             "尚未确认稳定关键帧",
         )
+        self.ui_anchor_preview_group, self.ui_anchor_preview = self._preview_group(
+            "屏幕固定 UI 锚点",
+            "等待世界运动与固定区域支持",
+        )
+        self.ui_anchor_detail_label = QLabel("等待 UI 锚点分析详情")
+        self.ui_anchor_detail_label.setWordWrap(True)
+        self.ui_anchor_detail_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.ui_anchor_detail_label.setStyleSheet("color: #b9c0ca;")
+        ui_anchor_preview_actions = QHBoxLayout()
+        self.ui_anchor_export_button = QPushButton("导出当前掩码可视化…")
+        self.ui_anchor_export_button.setEnabled(False)
+        self.ui_anchor_export_button.setToolTip(
+            "将当前 UI 锚点整帧调试投影保存为无损 PNG；"
+            "只响应本次手动操作，不保存普通采样帧或新增候选。"
+        )
+        ui_anchor_preview_actions.addStretch(1)
+        ui_anchor_preview_actions.addWidget(self.ui_anchor_export_button)
+        ui_anchor_preview_layout = self.ui_anchor_preview_group.layout()
+        if isinstance(ui_anchor_preview_layout, QVBoxLayout):
+            ui_anchor_preview_layout.addLayout(ui_anchor_preview_actions)
+            ui_anchor_preview_layout.addWidget(self.ui_anchor_detail_label)
         self.icon_preview_group, self.icon_preview = self._preview_group(
-            "最近记录的固定 HUD 候选",
+            "最近固定 HUD / SAM 候选",
             "图标记录未启用或尚未确认",
         )
-        evidence_layout.addWidget(self.keyframe_preview_group, 1)
-        evidence_layout.addWidget(self.icon_preview_group, 1)
+        icon_template_actions = QHBoxLayout()
+        self.icon_template_accept_button = QPushButton("登记为临时模板")
+        self.icon_template_reject_button = QPushButton("拒绝本次掩码")
+        self.icon_template_accept_button.setEnabled(False)
+        self.icon_template_reject_button.setEnabled(False)
+        self.icon_template_accept_button.setToolTip(
+            "保存 PROVISIONAL 模板，并在本次运行内加入位置+掩码核验。"
+        )
+        self.icon_template_reject_button.setToolTip(
+            "只丢弃当前 SAM 掩码预览；原始 HUD 候选仍保留。"
+        )
+        icon_template_actions.addWidget(self.icon_template_accept_button)
+        icon_template_actions.addWidget(self.icon_template_reject_button)
+        icon_preview_layout = self.icon_preview_group.layout()
+        if isinstance(icon_preview_layout, QVBoxLayout):
+            icon_preview_layout.addLayout(icon_template_actions)
+        self.evidence_tabs = QTabWidget()
+        self.evidence_tabs.addTab(self.keyframe_preview_group, "关键帧")
+        self.evidence_tabs.addTab(self.ui_anchor_preview_group, "UI 锚点")
+        self.evidence_tabs.addTab(self.icon_preview_group, "图标 / SAM")
+        if self.ui_anchor_check.isChecked():
+            self.evidence_tabs.setCurrentWidget(self.ui_anchor_preview_group)
+        evidence_layout.addWidget(self.evidence_tabs, 1)
         preview_layout.addWidget(self.live_preview_group, 2)
         preview_layout.addWidget(evidence_container, 1)
         splitter.addWidget(preview_container)
@@ -298,9 +418,16 @@ class MinimalTraceWindow(QMainWindow):
             ("counts", "处理 / 接受 / 去重 / 错误"),
             ("ocr_state", "OCR 状态"),
             ("ocr_counts", "OCR 提交 / 缓存 / 命中 / 回退"),
+            ("ui_anchor_state", "UI 锚点发现状态"),
+            ("ui_anchor_progress", "UI 锚点支持进度"),
+            ("ui_anchor_motion", "UI 锚点运动证据"),
             ("icon_state", "固定 HUD 候选状态"),
+            ("icon_gate", "CV 变化门控"),
+            ("icon_sam", "SAM 掩码候选"),
+            ("icon_template", "位置+掩码模板核验"),
             ("icon_counts", "图标确认 / 冷却 / 点位重复 / 视觉重复 / 保存"),
             ("artifact", "最近保存"),
+            ("ui_anchor_artifact", "最近 UI 锚点候选"),
             ("icon_artifact", "最近图标候选"),
             ("error", "最近错误"),
         ):
@@ -348,9 +475,16 @@ class MinimalTraceWindow(QMainWindow):
         self.output_browse_button.clicked.connect(self._browse_output)
         self.persist_check.toggled.connect(self._persistence_toggled)
         self.icon_record_check.toggled.connect(self._icon_record_toggled)
+        self.ui_anchor_check.toggled.connect(self._ui_anchor_toggled)
+        self.evidence_tabs.currentChanged.connect(self._evidence_tab_changed)
+        self.ui_anchor_export_button.clicked.connect(
+            self._export_ui_anchor_visualization
+        )
         self.advanced_settings_button.clicked.connect(self._open_advanced_settings)
         self.start_button.clicked.connect(self._start_requested)
         self.stop_button.clicked.connect(self._stop_requested)
+        self.icon_template_accept_button.clicked.connect(self._accept_icon_template)
+        self.icon_template_reject_button.clicked.connect(self._reject_icon_segmentation)
 
     def _populate_backends(self) -> None:
         self.backend_combo.clear()
@@ -381,7 +515,7 @@ class MinimalTraceWindow(QMainWindow):
         self.cursor_capture_check.setEnabled(
             is_wgc
             and self._capture_session is None
-            and not self.icon_record_check.isChecked()
+            and not self._visual_sidecar_enabled()
         )
         if not is_wgc:
             self.cursor_capture_check.setChecked(False)
@@ -440,9 +574,81 @@ class MinimalTraceWindow(QMainWindow):
         if selected:
             self.output_edit.setText(selected)
 
+    def _export_ui_anchor_visualization(self) -> None:
+        current_image = self._ui_anchor_image
+        if current_image is None or current_image.isNull():
+            self.ui_anchor_export_button.setEnabled(False)
+            self.statusBar().showMessage("暂无可导出的 UI 锚点掩码可视化", 5_000)
+            return
+
+        image = current_image.copy()
+        frame_id = self._ui_anchor_preview_frame_id
+        scope_id = self._ui_anchor_preview_scope_id
+        output_text = self.output_edit.text().strip()
+        output_directory = (
+            Path(output_text).expanduser() if output_text else self._output_root
+        )
+        safe_frame_id = self._safe_export_filename_component(frame_id)
+        default_path = output_directory / (
+            "ui-anchor-visualization-"
+            f"{datetime.now():%Y%m%d-%H%M%S}-{safe_frame_id}.png"
+        )
+        selected = self._choose_ui_anchor_export_path(default_path)
+        if not selected:
+            return
+
+        destination = Path(selected).expanduser()
+        if destination.suffix.lower() != ".png":
+            destination = destination.with_name(f"{destination.name}.png")
+        try:
+            saved = image.save(str(destination), "PNG")
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._report_ui_anchor_export_error(f"导出 UI 锚点掩码可视化失败：{exc}")
+            return
+        if not saved:
+            self._report_ui_anchor_export_error(
+                f"导出 UI 锚点掩码可视化失败：无法写入 {destination}"
+            )
+            return
+
+        identity = " · ".join(
+            part
+            for part in (
+                f"frame {frame_id}" if frame_id else "",
+                f"scope {scope_id}" if scope_id else "",
+            )
+            if part
+        )
+        message = f"已导出 UI 锚点掩码可视化：{destination}"
+        if identity:
+            message = f"{message}（{identity}）"
+        self._append_log(message)
+        self.statusBar().showMessage(message, 5_000)
+
+    def _choose_ui_anchor_export_path(self, default_path: Path) -> str:
+        return self._ui_anchor_export_path_provider(self, default_path)
+
+    def _report_ui_anchor_export_error(self, message: str) -> None:
+        self.metric_labels["error"].setText(message)
+        self._append_log(message)
+        self.statusBar().showMessage(message, 5_000)
+
+    @staticmethod
+    def _safe_export_filename_component(value: object) -> str:
+        text = str(value or "").strip()
+        safe = "".join(
+            character if character.isalnum() or character in "-_" else "-"
+            for character in text
+        )
+        while "--" in safe:
+            safe = safe.replace("--", "-")
+        return safe.strip("-_")[:64] or "latest"
+
     def _persistence_toggled(self, _enabled: bool) -> None:
         output_required = (
-            self.persist_check.isChecked() or self.icon_record_check.isChecked()
+            self.persist_check.isChecked()
+            or self.icon_record_check.isChecked()
+            or self.ui_anchor_check.isChecked()
         )
         editable = output_required and self._capture_session is None
         self.output_edit.setEnabled(editable)
@@ -453,6 +659,24 @@ class MinimalTraceWindow(QMainWindow):
             self.cursor_capture_check.setChecked(False)
         self._persistence_toggled(enabled)
         self._backend_changed()
+
+    def _ui_anchor_toggled(self, enabled: bool) -> None:
+        if enabled:
+            self.cursor_capture_check.setChecked(False)
+            self._show_ui_anchor_evidence_tab()
+        elif self._capture_session is None:
+            self.ui_anchor_detail_label.setText("UI 锚点发现未启用")
+        self._persistence_toggled(enabled)
+        self._backend_changed()
+
+    def _visual_sidecar_enabled(self) -> bool:
+        return self.icon_record_check.isChecked() or self.ui_anchor_check.isChecked()
+
+    def _show_ui_anchor_evidence_tab(self) -> None:
+        self.evidence_tabs.setCurrentWidget(self.ui_anchor_preview_group)
+
+    def _evidence_tab_changed(self, _index: int) -> None:
+        QTimer.singleShot(0, lambda: self._refresh_preview_images())
 
     def _open_advanced_settings(self) -> None:
         if self._capture_session is not None or self._keyframe_session is not None:
@@ -487,6 +711,9 @@ class MinimalTraceWindow(QMainWindow):
         ocr_session = None
         icon_recorder = None
         icon_catalog_policy = None
+        icon_segmentation = None
+        ui_anchor_discovery = None
+        self._icon_template_store = None
         try:
             current_process_id = get_window_process_id(window.hwnd)
             current_title = get_window_title(window.hwnd).strip()
@@ -501,12 +728,15 @@ class MinimalTraceWindow(QMainWindow):
             policy = self._build_policy()
             persist = self.persist_check.isChecked()
             record_icon = self.icon_record_check.isChecked()
+            discover_ui_anchor = self.ui_anchor_check.isChecked()
+            if discover_ui_anchor:
+                self._show_ui_anchor_evidence_tab()
             output_text = self.output_edit.text().strip()
-            if (persist or record_icon) and not output_text:
+            if (persist or record_icon or discover_ui_anchor) and not output_text:
                 raise ValueError("启用任一证据保存时，输出根目录不能为空")
             output_root = (
                 Path(output_text).expanduser().resolve()
-                if persist or record_icon
+                if persist or record_icon or discover_ui_anchor
                 else self._output_root
             )
             writer = KeyframeStore(output_root, policy) if persist else None
@@ -526,6 +756,36 @@ class MinimalTraceWindow(QMainWindow):
                 )
             if record_icon:
                 icon_catalog_policy = self._build_icon_catalog_policy()
+                settings = self._advanced_settings
+                self._icon_template_store = IconTemplateStore(output_root)
+                icon_segmentation = (
+                    self._icon_segmentation_factory(
+                        device=settings.icon_sam_device,
+                        response_timeout_s=settings.icon_sam_timeout_s,
+                        result_queue_size=1,
+                    )
+                    if settings.icon_sam_enabled
+                    else None
+                )
+                icon_change_gate = self._build_icon_change_gate()
+                icon_template_matcher = (
+                    PositionConstrainedIconMatcher(
+                        IconTemplateMatchPolicy(
+                            search_radius_normalized=(
+                                settings.icon_match_search_radius_normalized
+                            ),
+                            search_step_px=(settings.icon_match_search_step_px),
+                            absent_score_threshold=(
+                                settings.icon_match_absent_score_threshold
+                            ),
+                            present_score_threshold=(
+                                settings.icon_match_present_score_threshold
+                            ),
+                        )
+                    )
+                    if settings.icon_template_matching_enabled
+                    else None
+                )
                 icon_recorder = self._icon_recorder_factory(
                     detector=FixedHudIconDetector(self._build_icon_policy()),
                     writer=IconCandidateStore(
@@ -533,13 +793,34 @@ class MinimalTraceWindow(QMainWindow):
                         catalog_policy=icon_catalog_policy,
                     ),
                     catalog_policy=icon_catalog_policy,
+                    change_gate=icon_change_gate,
+                    segmentation_session=icon_segmentation,
+                    template_matcher=icon_template_matcher,
+                    max_active_templates=settings.icon_template_max_active,
+                )
+            if discover_ui_anchor:
+                settings = self._advanced_settings
+                ui_anchor_discovery = self._ui_anchor_session_factory(
+                    accumulator=ScreenLockedRegionAccumulator(
+                        self._build_ui_anchor_policy()
+                    ),
+                    writer=UiAnchorCandidateStore(
+                        output_root,
+                        policy=UiAnchorStorePolicy(
+                            max_candidates_per_session=(
+                                settings.ui_anchor_maximum_candidates
+                            )
+                        ),
+                    ),
                 )
             capture = self._capture_session_factory(
                 backend_name=backend_id,
                 target=target,
                 config=CaptureConfig(
                     cursor_capture=(
-                        self.cursor_capture_check.isChecked() and not record_icon
+                        self.cursor_capture_check.isChecked()
+                        and not record_icon
+                        and not discover_ui_anchor
                     )
                 ),
                 target_fps=float(self.capture_fps_spin.value()),
@@ -558,6 +839,7 @@ class MinimalTraceWindow(QMainWindow):
                 writer=writer,
                 ocr_session=ocr_session,
                 icon_recorder=icon_recorder,
+                ui_anchor_discovery=ui_anchor_discovery,
                 source_alive=source_alive,
             )
             self._policy_revision = policy.revision
@@ -591,18 +873,29 @@ class MinimalTraceWindow(QMainWindow):
                 f"{policy.stable_comparisons} 次比较；"
                 f"OCR={'开' if ocr_session else '关'}；"
                 f"关键帧保存={'开' if writer else '关'}；"
+                f"UI锚点发现={'开' if ui_anchor_discovery else '关'}；"
                 f"HUD候选保存={icon_recording_text}"
             )
             keyframes.start()
             capture.start()
         except Exception as exc:
-            for session in (capture, keyframes, ocr_session):
+            for session in (
+                capture,
+                keyframes,
+                ocr_session,
+                ui_anchor_discovery,
+            ):
                 if session is not None:
                     try:
                         session.request_stop()
                     except Exception:
                         pass
-            for session in (capture, keyframes, ocr_session):
+            for session in (
+                capture,
+                keyframes,
+                ocr_session,
+                ui_anchor_discovery,
+            ):
                 if session is not None:
                     try:
                         session.join(timeout=1.0)
@@ -610,6 +903,7 @@ class MinimalTraceWindow(QMainWindow):
                         pass
             self._capture_session = None
             self._keyframe_session = None
+            self._icon_template_store = None
             self._set_controls_enabled(True)
             self.stop_button.setEnabled(False)
             self._show_error(f"启动失败：{exc}")
@@ -688,28 +982,90 @@ class MinimalTraceWindow(QMainWindow):
             motion_grid_rows=settings.icon_motion_grid_rows,
             minimum_motion_grid_cells=settings.icon_minimum_motion_grid_cells,
             window_samples=settings.icon_window_samples,
-            required_motion_transitions=(
-                settings.icon_required_motion_transitions
-            ),
+            required_motion_transitions=(settings.icon_required_motion_transitions),
             fixed_max_radius_px=settings.icon_fixed_max_radius_px,
             fixed_max_path_px=settings.icon_fixed_max_path_px,
             cluster_radius_px=settings.icon_cluster_radius_px,
             minimum_cluster_points=settings.icon_minimum_cluster_points,
             minimum_candidate_side_px=settings.icon_minimum_candidate_side_px,
-            maximum_candidate_area_ratio=(
-                settings.icon_maximum_candidate_area_ratio
-            ),
+            maximum_candidate_area_ratio=(settings.icon_maximum_candidate_area_ratio),
             maximum_aspect_ratio=settings.icon_maximum_aspect_ratio,
             context_radius_px=settings.icon_context_radius_px,
-            minimum_context_moving_tracks=(
-                settings.icon_minimum_context_moving_tracks
-            ),
+            minimum_context_moving_tracks=(settings.icon_minimum_context_moving_tracks),
             context_motion_ratio=settings.icon_context_motion_ratio,
             confirmation_iou=settings.icon_confirmation_iou,
             confirmation_center_distance_px=(
                 settings.icon_confirmation_center_distance_px
             ),
             crop_padding_px=settings.icon_crop_padding_px,
+        )
+
+    def _build_ui_anchor_policy(self) -> UiAnchorDiscoveryPolicy:
+        settings = self._advanced_settings
+        return UiAnchorDiscoveryPolicy(
+            revision=self._policy_revision,
+            analysis_width=320,
+            analysis_height=180,
+            sample_interval_ms=settings.ui_anchor_sample_interval_ms,
+            max_sample_gap_ms=settings.ui_anchor_max_sample_gap_ms,
+            maximum_evidence_gap_ms=(settings.ui_anchor_maximum_evidence_gap_ms),
+            support_target=settings.ui_anchor_support_target,
+            stable_pixel_delta=settings.ui_anchor_stable_pixel_delta,
+            changed_pixel_delta=settings.ui_anchor_changed_pixel_delta,
+            minimum_changed_ratio=settings.ui_anchor_minimum_changed_ratio,
+            minimum_mean_difference=settings.ui_anchor_minimum_mean_difference,
+            strong_changed_ratio=settings.ui_anchor_strong_changed_ratio,
+            minimum_motion_grid_cells=(settings.ui_anchor_minimum_motion_grid_cells),
+            minimum_flow_tracks=settings.ui_anchor_minimum_flow_tracks,
+            flow_motion_threshold_px=(settings.ui_anchor_flow_motion_threshold_px),
+            minimum_flow_moving_ratio=(settings.ui_anchor_minimum_flow_moving_ratio),
+            minimum_flow_model_inlier_ratio=(
+                settings.ui_anchor_minimum_flow_model_inlier_ratio
+            ),
+            minimum_flow_grid_cells=(settings.ui_anchor_minimum_flow_grid_cells),
+            minimum_flow_perimeter_sides=(
+                settings.ui_anchor_minimum_flow_perimeter_sides
+            ),
+            quiet_samples_to_close_episode=(
+                settings.ui_anchor_quiet_samples_to_close_episode
+            ),
+            edge_threshold=settings.ui_anchor_edge_threshold,
+            motion_context_radius_px=(settings.ui_anchor_motion_context_radius_px),
+            vote_dilation_px=settings.ui_anchor_vote_dilation_px,
+            minimum_core_pixels=settings.ui_anchor_minimum_core_pixels,
+            minimum_candidate_side_px=(settings.ui_anchor_minimum_candidate_side_px),
+            maximum_candidate_area_ratio=(
+                settings.ui_anchor_maximum_candidate_area_ratio
+            ),
+            minimum_support_ratio=settings.ui_anchor_minimum_support_ratio,
+            minimum_motion_episodes=(settings.ui_anchor_minimum_motion_episodes),
+            minimum_motion_direction_bins=(
+                settings.ui_anchor_minimum_motion_direction_bins
+            ),
+            maximum_candidates=settings.ui_anchor_maximum_candidates,
+            translucent_enabled=settings.ui_anchor_translucent_enabled,
+            translucent_edge_threshold=(
+                settings.ui_anchor_translucent_edge_threshold
+            ),
+            translucent_orientation_similarity=(
+                settings.ui_anchor_translucent_orientation_similarity
+            ),
+            translucent_max_local_change_ratio=(
+                settings.ui_anchor_translucent_max_local_change_ratio
+            ),
+            translucent_minimum_support_ratio=(
+                settings.ui_anchor_translucent_minimum_support_ratio
+            ),
+            refinement_enabled=settings.ui_anchor_refinement_enabled,
+            refinement_max_observations=(
+                settings.ui_anchor_refinement_max_observations
+            ),
+            refinement_no_growth_observations=(
+                settings.ui_anchor_refinement_no_growth_observations
+            ),
+            refinement_expansion_radius_px=(
+                settings.ui_anchor_refinement_expansion_radius_px
+            ),
         )
 
     def _build_icon_catalog_policy(self) -> IconCatalogPolicy:
@@ -723,6 +1079,31 @@ class MinimalTraceWindow(QMainWindow):
             visual_normalized_mae=settings.icon_visual_normalized_mae,
             same_slot_radius_px=settings.icon_same_slot_radius_px,
             same_slot_iou=settings.icon_same_slot_iou,
+        )
+
+    def _build_icon_change_gate(self) -> IconChangeGate | None:
+        settings = self._advanced_settings
+        if not settings.icon_change_gate_enabled:
+            return None
+        return IconChangeGate(
+            IconChangeGatePolicy(
+                revision=self._policy_revision,
+                pixel_delta_threshold=(settings.icon_change_pixel_delta_threshold),
+                normal_changed_ratio=settings.icon_change_normal_ratio,
+                normal_mean_difference=(settings.icon_change_normal_mean_difference),
+                normal_minimum_active_cells=(settings.icon_change_minimum_active_cells),
+                normal_consecutive_samples=(settings.icon_change_normal_samples),
+                strong_changed_ratio=settings.icon_change_strong_ratio,
+                strong_mean_difference=(settings.icon_change_strong_mean_difference),
+                quiet_changed_ratio=settings.icon_change_quiet_ratio,
+                quiet_mean_difference=(settings.icon_change_quiet_mean_difference),
+                quiet_consecutive_samples=(settings.icon_change_quiet_samples),
+                active_scan_min_ms=settings.icon_change_active_min_ms,
+                active_scan_max_ms=settings.icon_change_active_max_ms,
+                cooldown_ms=settings.icon_change_cooldown_ms,
+                detector_hit_cooldown_ms=(settings.icon_change_hit_cooldown_ms),
+                max_sample_gap_ms=(settings.icon_change_max_sample_gap_ms),
+            )
         )
 
     def _stop_requested(self) -> None:
@@ -765,7 +1146,15 @@ class MinimalTraceWindow(QMainWindow):
         self._drain_capture_statuses(session)
         self._drain_preview_frames(session)
         self._drain_keyframes(session)
+        scope_state = self._sync_ui_anchor_scope(session)
+        ui_anchor_event_state = self._drain_ui_anchor_events(session)
+        if ui_anchor_event_state is None:
+            ui_anchor_event_state = scope_state
+        self._drain_ui_anchor_previews(session)
+        self._drain_ui_anchor_candidates(session)
         self._drain_icon_candidates(session)
+        self._drain_icon_segmentations(session)
+        self._drain_icon_template_matches(session)
         self._drain_keyframe_events(session)
         self._drain_icon_events(session)
         stats = session.stats()
@@ -782,9 +1171,183 @@ class MinimalTraceWindow(QMainWindow):
             f"{getattr(stats, 'ocr_semantic_matches', 0)} / "
             f"{getattr(stats, 'ocr_fallbacks', 0)}"
         )
+        ui_anchor_refining = int(
+            getattr(stats, "ui_anchor_refining_regions", 0)
+        )
+        ui_anchor_state = str(getattr(session, "ui_anchor_state", "DISABLED"))
+        if ui_anchor_event_state is not None:
+            ui_anchor_state = ui_anchor_event_state
+        elif ui_anchor_refining > 0:
+            ui_anchor_state = f"REFINING · {ui_anchor_refining} 个区域"
+        self.metric_labels["ui_anchor_state"].setText(ui_anchor_state)
+        ui_anchor_support = int(getattr(stats, "ui_anchor_maximum_support", 0))
+        ui_anchor_target = int(
+            getattr(
+                stats,
+                "ui_anchor_support_target",
+                self._advanced_settings.ui_anchor_support_target,
+            )
+        )
+        ui_anchor_translucent_support = int(
+            getattr(stats, "ui_anchor_maximum_translucent_support", 0)
+        )
+        ui_anchor_eligible = int(getattr(stats, "ui_anchor_eligible_observations", 0))
+        ui_anchor_regions = int(getattr(stats, "ui_anchor_progress_regions", 0))
+        ui_anchor_promoted = int(getattr(stats, "ui_anchor_promoted_candidates", 0))
+        ui_anchor_persisted = int(getattr(stats, "ui_anchor_persisted_candidates", 0))
+        ui_anchor_reason = str(getattr(stats, "ui_anchor_last_reason_code", "DISABLED"))
+        self.metric_labels["ui_anchor_progress"].setText(
+            f"最大 {ui_anchor_support}/{ui_anchor_target} · "
+            f"半透明形状 {ui_anchor_translucent_support}/{ui_anchor_target} · "
+            f"有效运动支持 {ui_anchor_eligible} · 区域 {ui_anchor_regions} · "
+            f"精修中 {ui_anchor_refining} · "
+            f"晋升/保存 {ui_anchor_promoted}/{ui_anchor_persisted} · "
+            f"{ui_anchor_reason}"
+        )
+        ui_anchor_analyzed = int(getattr(stats, "ui_anchor_analyzed_samples", 0))
+        ui_anchor_motion = int(getattr(stats, "ui_anchor_motion_qualified_samples", 0))
+        ui_anchor_episodes = int(getattr(stats, "ui_anchor_motion_episodes", 0))
+        ui_anchor_directions = int(getattr(stats, "ui_anchor_direction_bins", 0))
+        ui_anchor_changed_ratio = float(getattr(stats, "ui_anchor_changed_ratio", 0.0))
+        ui_anchor_mean = float(getattr(stats, "ui_anchor_mean_difference", 0.0))
+        ui_anchor_flow_model_inliers = float(
+            getattr(stats, "ui_anchor_flow_model_inlier_ratio", 0.0)
+        )
+        ui_anchor_perimeter_sides = int(
+            getattr(stats, "ui_anchor_moving_flow_perimeter_sides", 0)
+        )
+        ui_anchor_strong_transition = bool(
+            getattr(stats, "ui_anchor_strong_transition", False)
+        )
+        self.metric_labels["ui_anchor_motion"].setText(
+            f"有效/分析 {ui_anchor_motion}/{ui_anchor_analyzed} · "
+            f"运动阶段 {ui_anchor_episodes} · 方向 {ui_anchor_directions} · "
+            f"模型内点 {ui_anchor_flow_model_inliers * 100:.1f}% · "
+            f"边侧 {ui_anchor_perimeter_sides}/4 · "
+            f"强变化 {'是' if ui_anchor_strong_transition else '否'} · "
+            f"变化 {ui_anchor_changed_ratio * 100:.3f}% / "
+            f"mean {ui_anchor_mean:.3f}"
+        )
         self.metric_labels["icon_state"].setText(
             str(getattr(session, "icon_state", "DISABLED"))
         )
+        gate_state = self._stat_value(
+            stats,
+            "gate_state",
+            "icon_gate_state",
+            default="DISABLED",
+        )
+        gate_pair_ratio = self._stat_value(
+            stats,
+            "gate_pair_changed_ratio",
+            "icon_gate_pair_changed_ratio",
+            default=None,
+        )
+        gate_pair_mean = self._stat_value(
+            stats,
+            "gate_pair_mean_difference",
+            "icon_gate_pair_mean_difference",
+            default=None,
+        )
+        gate_anchor_ratio = self._stat_value(
+            stats,
+            "gate_anchor_changed_ratio",
+            "icon_gate_anchor_changed_ratio",
+            default=None,
+        )
+        gate_anchor_mean = self._stat_value(
+            stats,
+            "gate_anchor_mean_difference",
+            "icon_gate_anchor_mean_difference",
+            default=None,
+        )
+        gate_wakeups = self._stat_value(
+            stats,
+            "gate_wakeups",
+            "icon_gate_wakeups",
+        )
+        gate_idle_skips = self._stat_value(
+            stats,
+            "gate_idle_skips",
+            "icon_gate_idle_skips",
+        )
+        self.metric_labels["icon_gate"].setText(
+            f"{gate_state} · 唤醒 {gate_wakeups} / 静默跳过 {gate_idle_skips} · "
+            f"相邻 {self._format_optional_difference(gate_pair_ratio, gate_pair_mean)} · "
+            f"锚点 {self._format_optional_difference(gate_anchor_ratio, gate_anchor_mean)}"
+        )
+        segmentation_state = str(
+            getattr(session, "icon_segmentation_state", "DISABLED")
+        )
+        segmentation_submitted = self._stat_value(
+            stats,
+            "segmentation_submitted",
+            "icon_segmentation_submitted",
+        )
+        segmentation_succeeded = self._stat_value(
+            stats,
+            "segmentation_succeeded",
+            "icon_segmentation_succeeded",
+        )
+        segmentation_unavailable = self._stat_value(
+            stats,
+            "segmentation_unavailable",
+            "icon_segmentation_unavailable",
+        )
+        segmentation_failed = self._stat_value(
+            stats,
+            "segmentation_failed",
+            "icon_segmentation_failed",
+        )
+        segmentation_cancelled = self._stat_value(
+            stats,
+            "segmentation_cancelled",
+            "icon_segmentation_cancelled",
+        )
+        segmentation_unknown = self._stat_value(
+            stats,
+            "segmentation_unknown",
+            "icon_segmentation_unknown",
+        )
+        if self._icon_sam_detail is None:
+            self.metric_labels["icon_sam"].setText(
+                f"{segmentation_state} · 提交 {segmentation_submitted} / "
+                f"成功 {segmentation_succeeded} / "
+                f"不可用 {segmentation_unavailable} / "
+                f"失败 {segmentation_failed} / "
+                f"取消 {segmentation_cancelled} / UNKNOWN {segmentation_unknown}"
+            )
+        registered_templates = self._stat_value(
+            stats,
+            "registered_templates",
+            "icon_registered_templates",
+        )
+        match_runs = self._stat_value(
+            stats,
+            "template_match_runs",
+            "icon_template_match_runs",
+        )
+        match_present = self._stat_value(
+            stats,
+            "template_match_present",
+            "icon_template_match_present",
+        )
+        match_absent = self._stat_value(
+            stats,
+            "template_match_absent",
+            "icon_template_match_absent",
+        )
+        match_unknown = self._stat_value(
+            stats,
+            "template_match_unknown",
+            "icon_template_match_unknown",
+        )
+        if self.metric_labels["icon_template"].text() in {"—", "DISABLED"}:
+            self.metric_labels["icon_template"].setText(
+                f"临时模板 {registered_templates} / 核验轮次 {match_runs} · "
+                f"PRESENT {match_present} / ABSENT {match_absent} / "
+                f"UNKNOWN {match_unknown}"
+            )
         confirmed_candidates = self._stat_value(
             stats,
             "confirmed_candidates",
@@ -876,6 +1439,316 @@ class MinimalTraceWindow(QMainWindow):
         except (TypeError, ValueError) as exc:
             self.metric_labels["error"].setText(str(exc))
 
+    def _drain_ui_anchor_previews(self, session) -> None:
+        preview_queue = getattr(session, "ui_anchor_previews", None)
+        if preview_queue is None:
+            return
+        preview = self._get_latest(preview_queue)
+        if preview is None:
+            return
+        preview_scope_id = getattr(preview, "scope_id", None)
+        if (
+            self._active_ui_anchor_scope_id is not None
+            and preview_scope_id != self._active_ui_anchor_scope_id
+        ):
+            return
+        try:
+            self._ui_anchor_image = self._rgb_to_qimage(preview.rgb_pixels)
+            frame_id = getattr(preview, "frame_id", None)
+            self._ui_anchor_preview_frame_id = (
+                None if frame_id is None else str(frame_id)
+            )
+            self._ui_anchor_preview_scope_id = (
+                self._active_ui_anchor_scope_id
+                if preview_scope_id is None
+                else str(preview_scope_id)
+            )
+            self._set_preview_image(
+                self.ui_anchor_preview,
+                self._ui_anchor_image,
+            )
+            self.ui_anchor_export_button.setEnabled(True)
+            self.ui_anchor_detail_label.setText(
+                self._format_ui_anchor_analysis_detail(
+                    getattr(preview, "analysis", None)
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            self.metric_labels["error"].setText(str(exc))
+
+    def _drain_ui_anchor_candidates(self, session) -> None:
+        candidate_queue = getattr(session, "ui_anchor_candidates", None)
+        if candidate_queue is None:
+            return
+        recorded = self._get_latest(candidate_queue)
+        if recorded is None:
+            return
+        candidate = getattr(recorded, "candidate", None)
+        artifact = getattr(recorded, "artifact", None)
+        if candidate is None:
+            return
+        candidate_scope_id = getattr(candidate, "scope_id", None)
+        if (
+            self._active_ui_anchor_scope_id is not None
+            and candidate_scope_id != self._active_ui_anchor_scope_id
+        ):
+            return
+        artifact_directory = getattr(artifact, "directory", None)
+        display_path = str(
+            artifact_directory
+            or getattr(artifact, "reference_path", None)
+            or candidate.candidate_id
+        )
+        self.metric_labels["ui_anchor_artifact"].setText(display_path)
+        self.ui_anchor_detail_label.setText(
+            self._format_ui_anchor_candidate_detail(candidate)
+        )
+
+    @classmethod
+    def _format_ui_anchor_analysis_detail(cls, analysis) -> str:
+        if analysis is None:
+            return "等待 UI 锚点分析详情"
+        regions = tuple(getattr(analysis, "progress_regions", ()) or ())
+        refinements = tuple(
+            getattr(analysis, "refinement_regions", ()) or ()
+        )
+        if not regions and not refinements:
+            reason_code = str(getattr(analysis, "reason_code", "WAITING_FRAME"))
+            motion_qualified = getattr(analysis, "motion_qualified", None)
+            gate = (
+                "通过"
+                if motion_qualified is True
+                else ("未通过" if motion_qualified is False else "未知")
+            )
+            state_object = getattr(analysis, "motion_state", "UNKNOWN")
+            state = str(getattr(state_object, "value", state_object))
+            return f"无临时证据区 · 门禁 {gate} · 状态 {state} · 原因 {reason_code}"
+
+        sections: list[str] = []
+        if refinements:
+            visible_refinements = [
+                cls._format_ui_anchor_refinement_detail(region, index=index)
+                for index, region in enumerate(refinements[:3], start=1)
+            ]
+            hidden_refinements = max(
+                0,
+                len(refinements) - len(visible_refinements),
+            )
+            refinement_suffix = (
+                ""
+                if hidden_refinements == 0
+                else f" · 另有 {hidden_refinements} 个"
+            )
+            sections.append(
+                f"掩码精修 {len(refinements)} 个 · "
+                + " | ".join(visible_refinements)
+                + refinement_suffix
+            )
+        if regions:
+            visible = [
+                cls._format_ui_anchor_region_detail(region, index=index)
+                for index, region in enumerate(regions[:3], start=1)
+            ]
+            hidden_count = max(0, len(regions) - len(visible))
+            suffix = "" if hidden_count == 0 else f" · 另有 {hidden_count} 个"
+            sections.append(
+                f"临时证据区 {len(regions)} 个 · "
+                + " | ".join(visible)
+                + suffix
+            )
+        return " || ".join(sections)
+
+    @staticmethod
+    def _format_ui_anchor_refinement_detail(region, *, index: int) -> str:
+        refinement_id = str(
+            getattr(region, "refinement_id", f"F{index}")
+        )
+        observations = getattr(region, "observations", "—")
+        maximum = getattr(region, "maximum_observations", "—")
+        no_growth = getattr(region, "no_growth_observations", "—")
+        no_growth_target = getattr(region, "no_growth_target", "—")
+        added_pixels = getattr(region, "added_pixels", None)
+        if callable(added_pixels):
+            added_pixels = added_pixels()
+        if added_pixels is None:
+            added_mask = np.asarray(
+                getattr(
+                    region,
+                    "added_mask",
+                    np.zeros((0, 0), dtype=np.bool_),
+                ),
+                dtype=np.bool_,
+            )
+            added_pixels = int(np.count_nonzero(added_mask))
+        radius = getattr(region, "expansion_radius_px", "—")
+        return (
+            f"{refinement_id} [REFINING] · 观察 {observations}/{maximum} · "
+            f"新增 {added_pixels} px · 无新增 {no_growth}/{no_growth_target} · "
+            f"固定扩展 {radius} px"
+        )
+
+    @classmethod
+    def _format_ui_anchor_region_detail(cls, region, *, index: int) -> str:
+        region_id = str(getattr(region, "region_id", f"region-{index}"))
+        stage_object = getattr(region, "stage", "ACCUMULATING")
+        stage = str(getattr(stage_object, "value", stage_object))
+        support_count = getattr(region, "support_count", "—")
+        support_target = getattr(
+            region,
+            "target",
+            getattr(region, "support_target", "—"),
+        )
+        support_ratio = cls._format_ui_anchor_ratio(
+            getattr(region, "support_ratio", None)
+        )
+        episodes = getattr(region, "independent_motion_episodes", "—")
+        direction_bins = getattr(region, "motion_direction_bins", ()) or ()
+        direction_count = getattr(
+            region,
+            "direction_diversity_count",
+            getattr(region, "direction_diversity", None),
+        )
+        if direction_count is None:
+            try:
+                direction_count = len(direction_bins)
+            except TypeError:
+                direction_count = "—"
+        if isinstance(direction_bins, str):
+            direction_text = direction_bins
+        else:
+            try:
+                direction_text = ",".join(str(value) for value in direction_bins)
+            except TypeError:
+                direction_text = str(direction_bins)
+        direction_text = direction_text or "—"
+        completion = getattr(
+            region,
+            "completion_ratio",
+            getattr(region, "completion", None),
+        )
+        if completion is None:
+            try:
+                target_value = float(support_target)
+                completion = (
+                    float(support_count) / target_value if target_value > 0 else None
+                )
+            except (TypeError, ValueError):
+                completion = None
+        completion_text = cls._format_ui_anchor_ratio(completion)
+        translucent_mask = np.asarray(
+            getattr(
+                region,
+                "translucent_core_mask",
+                np.zeros((0, 0), dtype=np.bool_),
+            ),
+            dtype=np.bool_,
+        )
+        translucent_pixels = int(np.count_nonzero(translucent_mask))
+        evidence_text = (
+            f"半透明形状提示 {translucent_pixels} px"
+            if translucent_pixels
+            else "不透明稳定"
+        )
+        blocking_text = cls._format_ui_anchor_blocking_reasons(
+            getattr(
+                region,
+                "blocking_reasons",
+                getattr(region, "blocking_reason", ()),
+            )
+        )
+        return (
+            f"{region_id} [{stage}] · 支持 {support_count}/{support_target} "
+            f"({support_ratio}) · {evidence_text} · 独立阶段 {episodes} · "
+            f"方向 {direction_count}（{direction_text}） · "
+            f"证据完成度 {completion_text} · 阻塞 {blocking_text}"
+        )
+
+    @classmethod
+    def _format_ui_anchor_candidate_detail(cls, candidate) -> str:
+        candidate_id = str(getattr(candidate, "candidate_id", "—"))
+        lifecycle_object = getattr(candidate, "lifecycle", "RECORDED")
+        lifecycle = str(getattr(lifecycle_object, "value", lifecycle_object))
+        support_count = getattr(candidate, "support_count", "—")
+        policy = getattr(candidate, "policy", None)
+        support_target = getattr(
+            candidate,
+            "target",
+            getattr(policy, "support_target", "—"),
+        )
+        support_ratio = cls._format_ui_anchor_ratio(
+            getattr(candidate, "support_ratio", None)
+        )
+        episodes = getattr(candidate, "independent_motion_episodes", "—")
+        direction_bins = getattr(candidate, "motion_direction_bins", ()) or ()
+        try:
+            direction_count = len(direction_bins)
+        except TypeError:
+            direction_count = "—"
+        if isinstance(direction_bins, str):
+            direction_text = direction_bins
+        else:
+            try:
+                direction_text = ",".join(str(value) for value in direction_bins)
+            except TypeError:
+                direction_text = str(direction_bins)
+        direction_text = direction_text or "—"
+        return (
+            f"已记录 {candidate_id} [{lifecycle}] · "
+            f"支持 {support_count}/{support_target} ({support_ratio}) · "
+            f"独立阶段 {episodes} · 方向 {direction_count}（{direction_text}）"
+        )
+
+    @staticmethod
+    def _format_ui_anchor_ratio(value) -> str:
+        if value is None:
+            return "—"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not np.isfinite(numeric):
+            return str(value)
+        return f"{numeric:.1%}"
+
+    @staticmethod
+    def _format_ui_anchor_blocking_reasons(reasons) -> str:
+        if reasons is None:
+            return "无"
+        enum_value = getattr(reasons, "value", None)
+        if enum_value is not None:
+            return str(enum_value)
+        if isinstance(reasons, str):
+            return reasons or "无"
+        try:
+            values = [str(getattr(value, "value", value)) for value in reasons]
+        except TypeError:
+            return str(reasons)
+        return "、".join(values) if values else "无"
+
+    def _sync_ui_anchor_scope(self, session) -> str | None:
+        scope_id = getattr(session, "ui_anchor_scope_id", None)
+        if callable(scope_id):
+            scope_id = scope_id()
+        if scope_id is None:
+            return None
+        scope_id = str(scope_id)
+        if scope_id == self._active_ui_anchor_scope_id:
+            return None
+        self._activate_ui_anchor_scope(scope_id)
+        return "PRIMING · 新采集范围"
+
+    def _activate_ui_anchor_scope(self, scope_id: str) -> None:
+        self._active_ui_anchor_scope_id = scope_id
+        self._ui_anchor_image = None
+        self._ui_anchor_preview_frame_id = None
+        self._ui_anchor_preview_scope_id = None
+        self.ui_anchor_export_button.setEnabled(False)
+        self.ui_anchor_preview.clear()
+        self.ui_anchor_preview.setText("等待新采集范围的 UI 锚点支持")
+        self.ui_anchor_detail_label.setText("新采集范围 · 等待首个分析结果")
+        self.metric_labels["ui_anchor_artifact"].setText("—")
+        self.metric_labels["ui_anchor_state"].setText("PRIMING · 新采集范围")
+
     def _drain_icon_candidates(self, session) -> None:
         candidate_queue = getattr(session, "icon_candidates", None)
         if candidate_queue is None:
@@ -886,8 +1759,93 @@ class MinimalTraceWindow(QMainWindow):
         try:
             self._icon_image = self._icon_candidate_to_qimage(candidate)
             self._set_preview_image(self.icon_preview, self._icon_image)
+            if self._advanced_settings.icon_sam_enabled:
+                self._icon_sam_detail = None
+                self.metric_labels["icon_sam"].setText("PENDING · 等待 SAM 掩码")
         except (TypeError, ValueError) as exc:
             self.metric_labels["error"].setText(str(exc))
+
+    def _drain_icon_segmentations(self, session) -> None:
+        result_queue = getattr(session, "icon_segmentations", None)
+        if result_queue is None:
+            return
+        while True:
+            try:
+                event = result_queue.get_nowait()
+            except queue.Empty:
+                break
+            request = getattr(event, "request", None)
+            sequence = int(getattr(request, "sequence", 0))
+            if sequence <= self._last_icon_segmentation_sequence:
+                continue
+            self._last_icon_segmentation_sequence = sequence
+            result = getattr(event, "result", None)
+            status_object = getattr(result, "status", IconSegmentationStatus.UNKNOWN)
+            status = getattr(status_object, "value", str(status_object))
+            qa = getattr(result, "qa", None)
+            qa_object = getattr(
+                qa,
+                "status",
+                IconSegmentationQaStatus.UNKNOWN,
+            )
+            qa_status = getattr(qa_object, "value", str(qa_object))
+            reason_code = str(getattr(result, "reason_code", "UNKNOWN"))
+            score = getattr(result, "score", None)
+            score_text = "—" if score is None else f"{float(score):.3f}"
+            self._icon_sam_detail = (
+                f"{status} · QA {qa_status} · score {score_text} · {reason_code}"
+            )
+            self.metric_labels["icon_sam"].setText(self._icon_sam_detail)
+            can_review = (
+                status == IconSegmentationStatus.SUCCEEDED.value
+                and qa_status
+                in {
+                    IconSegmentationQaStatus.READY.value,
+                    IconSegmentationQaStatus.NEEDS_REVIEW.value,
+                }
+            )
+            overlay = getattr(result, "overlay_rgb", None)
+            if status == IconSegmentationStatus.SUCCEEDED.value and overlay is not None:
+                try:
+                    self._icon_image = self._rgb_to_qimage(overlay)
+                    self._set_preview_image(self.icon_preview, self._icon_image)
+                except (TypeError, ValueError) as exc:
+                    self.metric_labels["error"].setText(str(exc))
+                    can_review = False
+            self._pending_icon_segmentation_event = event if can_review else None
+            self.icon_template_accept_button.setEnabled(can_review)
+            self.icon_template_reject_button.setEnabled(
+                status == IconSegmentationStatus.SUCCEEDED.value
+            )
+            if can_review:
+                self._append_log(
+                    f"SAM 掩码待人工登记：{getattr(request, 'candidate_id', '—')} "
+                    f"· {qa_status} · score {score_text}"
+                )
+            elif status != IconSegmentationStatus.SUCCEEDED.value:
+                self._append_log(f"SAM 掩码保持 UNKNOWN：{reason_code}")
+
+    def _drain_icon_template_matches(self, session) -> None:
+        match_queue = getattr(session, "icon_template_matches", None)
+        if match_queue is None:
+            return
+        while True:
+            try:
+                event = match_queue.get_nowait()
+            except queue.Empty:
+                break
+            result = event.result
+            status = getattr(result.status, "value", str(result.status))
+            score_text = "—" if result.score is None else f"{result.score:.3f}"
+            bbox_text = "—" if result.bbox is None else str(result.bbox)
+            self.metric_labels["icon_template"].setText(
+                f"{event.template_id} · {status} · score {score_text} · "
+                f"bbox {bbox_text} · epoch {event.change_epoch}"
+            )
+            self._append_log(
+                f"模板存在性候选 {event.template_id}：{status} / "
+                f"{score_text}（不等同于界面状态）"
+            )
 
     def _drain_keyframe_events(self, session) -> None:
         while True:
@@ -908,8 +1866,99 @@ class MinimalTraceWindow(QMainWindow):
                 break
             self._display_icon_event(event)
 
+    def _drain_ui_anchor_events(self, session) -> str | None:
+        event_queue = getattr(session, "ui_anchor_events", None)
+        if event_queue is None:
+            return None
+        events = []
+        while True:
+            try:
+                events.append(event_queue.get_nowait())
+            except queue.Empty:
+                break
+        if not events:
+            return None
+
+        state_override: str | None = None
+        reported_scope_id = getattr(session, "ui_anchor_scope_id", None)
+        if callable(reported_scope_id):
+            reported_scope_id = reported_scope_id()
+        if reported_scope_id is not None:
+            reported_scope_id = str(reported_scope_id)
+        scope_resets = [
+            event
+            for event in events
+            if getattr(event.status, "value", str(event.status))
+            == UiAnchorEventStatus.SCOPE_RESET.value
+            and (reported_scope_id is None or event.scope_id == reported_scope_id)
+        ]
+        if scope_resets:
+            latest_reset = scope_resets[-1]
+            if latest_reset.scope_id is not None:
+                self._activate_ui_anchor_scope(latest_reset.scope_id)
+            state_override = "PRIMING · 新采集范围"
+
+        for event in events:
+            status = getattr(event.status, "value", str(event.status))
+            if status == UiAnchorEventStatus.SCOPE_RESET.value:
+                continue
+            if status == UiAnchorEventStatus.CANDIDATE_RECORDED.value:
+                if (
+                    self._active_ui_anchor_scope_id is not None
+                    and event.scope_id != self._active_ui_anchor_scope_id
+                ):
+                    continue
+                self._append_log(
+                    f"PROVISIONAL UI 锚点已记录："
+                    f"{event.candidate_id or '—'}（不等同于 UI 状态）"
+                )
+                continue
+            if status == UiAnchorEventStatus.RESOURCE_LIMIT_REACHED.value:
+                if (
+                    self._active_ui_anchor_scope_id is not None
+                    and event.scope_id
+                    not in {
+                        None,
+                        self._active_ui_anchor_scope_id,
+                    }
+                ):
+                    continue
+                self.metric_labels["ui_anchor_state"].setText("RESOURCE_LIMIT_REACHED")
+                self._append_log(
+                    "UI 锚点发现已达到资源保护上限，"
+                    "关键帧与图标支路继续："
+                    f"{event.error or event.reason_code}"
+                )
+                state_override = "RESOURCE_LIMIT_REACHED"
+                continue
+            self.metric_labels["ui_anchor_state"].setText("DEGRADED")
+            self.metric_labels["error"].setText(event.error or event.reason_code)
+            self._append_log(
+                "UI 锚点发现旁路失败（关键帧与图标支路继续）："
+                f"{event.error or event.reason_code}"
+            )
+            state_override = "DEGRADED"
+        return state_override
+
     def _display_icon_event(self, event: IconRecordEvent) -> None:
         status = getattr(event.status, "value", str(event.status))
+        if status == IconRecordStatus.GATE_TRANSITION.value:
+            details = event.details or {}
+            current = details.get("current_state", event.reason_code)
+            self.metric_labels["icon_gate"].setText(f"{current} · {event.reason_code}")
+            if event.reason_code not in {
+                "STABLE_ANCHOR_READY",
+                "COOLDOWN_COMPLETE",
+            }:
+                self._append_log(f"CV 变化门控：{event.reason_code} → {current}")
+            return
+        if status == IconRecordStatus.SEGMENTATION_NOTICE.value:
+            self._icon_sam_detail = f"UNKNOWN · {event.reason_code}"
+            self.metric_labels["icon_sam"].setText(self._icon_sam_detail)
+            self._append_log(
+                f"SAM 旁路保持 UNKNOWN：{event.error or event.reason_code}"
+            )
+            return
         if status == IconRecordStatus.RECORDED.value:
             artifact = event.artifact
             crop_path = getattr(artifact, "crop_path", None)
@@ -920,9 +1969,7 @@ class MinimalTraceWindow(QMainWindow):
             )
             return
         if status == "DUPLICATE_SKIPPED":
-            self._append_log(
-                f"固定 HUD 候选已去重跳过：{event.reason_code}"
-            )
+            self._append_log(f"固定 HUD 候选已去重跳过：{event.reason_code}")
             return
         if status == "COOLDOWN_SKIPPED":
             self._append_log(
@@ -935,15 +1982,64 @@ class MinimalTraceWindow(QMainWindow):
             return
         if status == "RESOURCE_LIMIT_REACHED":
             self.metric_labels["icon_state"].setText("RESOURCE_LIMIT_REACHED")
-            self._append_log(
-                f"固定 HUD 候选已因资源保护停止：{event.reason_code}"
-            )
+            self._append_log(f"固定 HUD 候选已因资源保护停止：{event.reason_code}")
             return
         self.metric_labels["icon_state"].setText("DEGRADED")
         self.metric_labels["error"].setText(event.error or event.reason_code)
         self._append_log(
-            f"图标记录旁路失败（关键帧继续运行）："
-            f"{event.error or event.reason_code}"
+            f"图标记录旁路失败（关键帧继续运行）：{event.error or event.reason_code}"
+        )
+
+    def _reject_icon_segmentation(self) -> None:
+        event = self._pending_icon_segmentation_event
+        self._pending_icon_segmentation_event = None
+        self.icon_template_accept_button.setEnabled(False)
+        self.icon_template_reject_button.setEnabled(False)
+        candidate_id = getattr(getattr(event, "request", None), "candidate_id", "—")
+        self._append_log(f"已拒绝本次 SAM 掩码 {candidate_id}；原始 HUD 候选仍保留")
+
+    def _accept_icon_template(self) -> None:
+        event = self._pending_icon_segmentation_event
+        store = self._icon_template_store
+        session = self._keyframe_session
+        if event is None or store is None or session is None:
+            return
+        result = getattr(event, "result", None)
+        request = getattr(event, "request", None)
+        candidate = getattr(request, "source_candidate", None)
+        qa_status_object = getattr(getattr(result, "qa", None), "status", None)
+        qa_status = getattr(qa_status_object, "value", str(qa_status_object))
+        if (
+            getattr(result, "status", None) is not IconSegmentationStatus.SUCCEEDED
+            or qa_status
+            not in {
+                IconSegmentationQaStatus.READY.value,
+                IconSegmentationQaStatus.NEEDS_REVIEW.value,
+            }
+            or candidate is None
+        ):
+            self.metric_labels["icon_sam"].setText("UNKNOWN · 当前掩码不满足登记边界")
+            self.icon_template_accept_button.setEnabled(False)
+            return
+        try:
+            template = store.save(candidate, result)
+            displaced = session.register_icon_template(template)
+        except Exception as exc:
+            self.metric_labels["error"].setText(str(exc))
+            self._append_log(f"临时模板登记失败：{exc}")
+            return
+        self._pending_icon_segmentation_event = None
+        self.icon_template_accept_button.setEnabled(False)
+        self.icon_template_reject_button.setEnabled(False)
+        self.metric_labels["icon_template"].setText(
+            f"{template.template_id} · PROVISIONAL · 等待下一次变化后稳定核验"
+        )
+        self.metric_labels["icon_artifact"].setText(str(template.artifact.directory))
+        displaced_text = (
+            "" if displaced is None else f"；活动上限淘汰旧模板 {displaced}"
+        )
+        self._append_log(
+            f"已登记 PROVISIONAL HUD 模板 {template.template_id}{displaced_text}"
         )
 
     def _display_event(self, event: KeyframeEvent) -> None:
@@ -1004,22 +2100,37 @@ class MinimalTraceWindow(QMainWindow):
         )
 
     @staticmethod
+    def _format_optional_difference(
+        changed_ratio: float | None,
+        mean_difference: float | None,
+    ) -> str:
+        if changed_ratio is None or mean_difference is None:
+            return "—"
+        return f"{changed_ratio * 100:.3f}% / mean {mean_difference:.3f}"
+
+    @staticmethod
     def _frame_to_qimage(frame) -> QImage:
         return frame_to_qimage(frame)
 
     @staticmethod
-    def _icon_candidate_to_qimage(candidate) -> QImage:
-        pixels = np.ascontiguousarray(candidate.crop_rgb, dtype=np.uint8)
-        if pixels.ndim != 3 or pixels.shape[2] != 3:
-            raise ValueError("图标候选裁剪必须是 RGB 三通道图像")
-        height, width, _channels = pixels.shape
-        image = QImage(
-            pixels.data,
+    def _rgb_to_qimage(pixels: np.ndarray) -> QImage:
+        values = np.ascontiguousarray(pixels, dtype=np.uint8)
+        if values.ndim != 3 or values.shape[2] != 3:
+            raise ValueError("预览图像必须是 RGB 三通道")
+        height, width, _channels = values.shape
+        return QImage(
+            values.data,
             width,
             height,
-            int(pixels.strides[0]),
+            int(values.strides[0]),
             QImage.Format.Format_RGB888,
         ).copy()
+
+    @staticmethod
+    def _icon_candidate_to_qimage(candidate) -> QImage:
+        pixels = np.ascontiguousarray(candidate.crop_rgb, dtype=np.uint8)
+        image = MinimalTraceWindow._rgb_to_qimage(pixels)
+        height, width, _channels = pixels.shape
         point_x, point_y = candidate.point_crop
         painter = QPainter(image)
         try:
@@ -1036,6 +2147,23 @@ class MinimalTraceWindow(QMainWindow):
         finally:
             painter.end()
         return image
+
+    @staticmethod
+    def _ui_anchor_candidate_to_qimage(candidate) -> QImage:
+        pixels = np.ascontiguousarray(candidate.reference_rgb, dtype=np.uint8)
+        stable_mask = np.asarray(candidate.stable_core_mask, dtype=np.bool_)
+        if stable_mask.shape != pixels.shape[:2]:
+            raise ValueError("UI 锚点稳定掩码尺寸与参考图不一致")
+        overlay = pixels.copy()
+        if np.any(stable_mask):
+            original = overlay[stable_mask].astype(np.float32)
+            highlight = np.asarray((64, 255, 96), dtype=np.float32)
+            overlay[stable_mask] = np.clip(
+                original * 0.55 + highlight * 0.45,
+                0,
+                255,
+            ).astype(np.uint8)
+        return MinimalTraceWindow._rgb_to_qimage(overlay)
 
     @staticmethod
     def _get_latest(target_queue):
@@ -1073,6 +2201,11 @@ class MinimalTraceWindow(QMainWindow):
             self._set_preview_image(self.live_preview, self._live_image)
         if self._keyframe_image is not None:
             self._set_preview_image(self.keyframe_preview, self._keyframe_image)
+        if self._ui_anchor_image is not None:
+            self._set_preview_image(
+                self.ui_anchor_preview,
+                self._ui_anchor_image,
+            )
         if self._icon_image is not None:
             self._set_preview_image(self.icon_preview, self._icon_image)
 
@@ -1083,6 +2216,11 @@ class MinimalTraceWindow(QMainWindow):
         if session is not None:
             session.join(timeout=0)
             self._refresh_session_outputs(session)
+        self._pending_icon_segmentation_event = None
+        self._icon_sam_detail = None
+        self.icon_template_accept_button.setEnabled(False)
+        self.icon_template_reject_button.setEnabled(False)
+        self._icon_template_store = None
         self._capture_session = None
         self._keyframe_session = None
         self._stopping = False
@@ -1101,11 +2239,32 @@ class MinimalTraceWindow(QMainWindow):
         self._live_image = None
         self._keyframe_image = None
         self._icon_image = None
+        self._ui_anchor_image = None
+        self._ui_anchor_preview_frame_id = None
+        self._ui_anchor_preview_scope_id = None
+        self._active_ui_anchor_scope_id = None
+        self.ui_anchor_export_button.setEnabled(False)
+        self._pending_icon_segmentation_event = None
+        self._last_icon_segmentation_sequence = 0
+        self._icon_sam_detail = None
+        self.icon_template_accept_button.setEnabled(False)
+        self.icon_template_reject_button.setEnabled(False)
         self._last_live_preview_ns = 0
         self.live_preview.clear()
         self.live_preview.setText("等待首帧")
         self.keyframe_preview.clear()
         self.keyframe_preview.setText("等待稳定且未重复的关键帧")
+        self.ui_anchor_preview.clear()
+        self.ui_anchor_preview.setText(
+            "等待世界运动与固定区域支持"
+            if self.ui_anchor_check.isChecked()
+            else "UI 锚点发现未启用"
+        )
+        self.ui_anchor_detail_label.setText(
+            "等待 UI 锚点分析详情"
+            if self.ui_anchor_check.isChecked()
+            else "UI 锚点发现未启用"
+        )
         self.icon_preview.clear()
         self.icon_preview.setText(
             "等待两段背景运动窗口"
@@ -1120,9 +2279,16 @@ class MinimalTraceWindow(QMainWindow):
             "counts",
             "ocr_state",
             "ocr_counts",
+            "ui_anchor_state",
+            "ui_anchor_progress",
+            "ui_anchor_motion",
             "icon_state",
+            "icon_gate",
+            "icon_sam",
+            "icon_template",
             "icon_counts",
             "artifact",
+            "ui_anchor_artifact",
             "icon_artifact",
             "error",
         ):
@@ -1131,13 +2297,47 @@ class MinimalTraceWindow(QMainWindow):
             "IDLE（等待灰区候选）" if self.ocr_check.isChecked() else "DISABLED"
         )
         self.metric_labels["ocr_counts"].setText("0 / 0 / 0 / 0")
+        self.metric_labels["ui_anchor_state"].setText(
+            "WAITING_FRAME" if self.ui_anchor_check.isChecked() else "DISABLED"
+        )
+        self.metric_labels["ui_anchor_progress"].setText(
+            f"0/{self._advanced_settings.ui_anchor_support_target} · 等待有效世界运动"
+            if self.ui_anchor_check.isChecked()
+            else "DISABLED"
+        )
+        self.metric_labels["ui_anchor_motion"].setText(
+            "等待运动门禁" if self.ui_anchor_check.isChecked() else "DISABLED"
+        )
         self.metric_labels["icon_state"].setText(
             "WAITING_FRAME" if self.icon_record_check.isChecked() else "DISABLED"
         )
+        self.metric_labels["icon_gate"].setText(
+            "PRIMING"
+            if (
+                self.icon_record_check.isChecked()
+                and self._advanced_settings.icon_change_gate_enabled
+            )
+            else "DISABLED"
+        )
+        self.metric_labels["icon_sam"].setText(
+            "IDLE"
+            if (
+                self.icon_record_check.isChecked()
+                and self._advanced_settings.icon_sam_enabled
+            )
+            else "DISABLED"
+        )
+        self.metric_labels["icon_template"].setText(
+            "等待 PROVISIONAL 模板"
+            if (
+                self.icon_record_check.isChecked()
+                and self._advanced_settings.icon_template_matching_enabled
+            )
+            else "DISABLED"
+        )
         icon_limit = self._advanced_settings.icon_max_unique_candidates
         self.metric_labels["icon_counts"].setText(
-            f"0 / 0 / 0 / 0 / 0/"
-            f"{'不限' if icon_limit is None else icon_limit}"
+            f"0 / 0 / 0 / 0 / 0/{'不限' if icon_limit is None else icon_limit}"
         )
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -1151,7 +2351,7 @@ class MinimalTraceWindow(QMainWindow):
         self.cursor_capture_check.setEnabled(
             enabled
             and self.backend_combo.currentData() == "wgc"
-            and not self.icon_record_check.isChecked()
+            and not self._visual_sidecar_enabled()
         )
         for widget in (
             self.stable_duration_spin,
@@ -1161,12 +2361,15 @@ class MinimalTraceWindow(QMainWindow):
             self.duplicate_ratio_spin,
             self.ocr_check,
             self.icon_record_check,
+            self.ui_anchor_check,
             self.advanced_settings_button,
             self.persist_check,
         ):
             widget.setEnabled(enabled)
         persistence_enabled = enabled and (
-            self.persist_check.isChecked() or self.icon_record_check.isChecked()
+            self.persist_check.isChecked()
+            or self.icon_record_check.isChecked()
+            or self.ui_anchor_check.isChecked()
         )
         self.output_edit.setEnabled(persistence_enabled)
         self.output_browse_button.setEnabled(persistence_enabled)

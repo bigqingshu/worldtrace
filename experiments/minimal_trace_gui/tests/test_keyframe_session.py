@@ -101,6 +101,86 @@ class _RecordingIconRecorder:
         return not self._alive
 
 
+class _RecordingUiAnchorDiscovery:
+    def __init__(
+        self,
+        *,
+        start_error: Exception | None = None,
+        submit_error: Exception | None = None,
+        submit_result: bool = True,
+    ) -> None:
+        self.events = queue.Queue()
+        self.candidates = queue.Queue()
+        self.previews = queue.Queue()
+        self.submitted = []
+        self.start_error = start_error
+        self.submit_error = submit_error
+        self.submit_result = submit_result
+        self.start_calls = 0
+        self.submit_calls = 0
+        self.started = False
+        self.stop_requested = False
+        self._alive = False
+        self.failure = None
+        self.state = "IDLE"
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def start(self) -> None:
+        self.start_calls += 1
+        self.started = True
+        if self.start_error is not None:
+            raise self.start_error
+        self._alive = True
+        self.state = "RUNNING"
+
+    def submit(self, frame) -> bool:
+        self.submit_calls += 1
+        if self.submit_error is not None:
+            raise self.submit_error
+        if not self.submit_result:
+            return False
+        self.submitted.append(frame.frame_id)
+        return True
+
+    def stats(self):
+        return SimpleNamespace(
+            submitted_frames=len(self.submitted),
+            dropped_frames=0,
+            ignored_frames=0,
+            analyzed_samples=len(self.submitted),
+            motion_qualified_samples=0,
+            eligible_observations=0,
+            motion_episode_count=0,
+            observed_direction_bins=0,
+            maximum_support=0,
+            maximum_translucent_support=0,
+            support_target=50,
+            progress_regions=0,
+            refining_regions=0,
+            promoted_candidates=0,
+            persisted_candidates=0,
+            last_reason_code="WAITING_FRAME",
+            changed_ratio=0.0,
+            mean_difference=0.0,
+            flow_model_inlier_ratio=0.0,
+            moving_flow_perimeter_sides=0,
+            strong_transition=False,
+            errors=0,
+        )
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        self._alive = False
+        self.state = "STOPPED"
+
+    def join(self, timeout=None) -> bool:
+        del timeout
+        return not self._alive
+
+
 def _ocr_scene(text: str):
     return extract_ocr_scene(
         (
@@ -254,6 +334,65 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
         self.assertEqual(stats.icon_cooldown_batches, 5)
         self.assertEqual(stats.icon_persisted_candidates, 3)
 
+    def test_icon_segmentation_and_template_match_boundaries_are_bridged(
+        self,
+    ) -> None:
+        recorder = _RecordingIconRecorder()
+        recorder.segmentations = queue.Queue()
+        recorder.template_matches = queue.Queue()
+        registered = []
+
+        def register_template(template):
+            registered.append(template)
+            return "displaced-template"
+
+        recorder.register_template = register_template
+        recorder.stats = lambda: SimpleNamespace(
+            submitted_frames=0,
+            dropped_frames=0,
+            analyzed_samples=0,
+            qualified_windows=0,
+            persisted_candidates=0,
+            segmentation_state="IDLE",
+            segmentation_submitted=3,
+            segmentation_succeeded=2,
+            segmentation_unavailable=1,
+            segmentation_failed=0,
+            segmentation_unknown=0,
+            registered_templates=1,
+            template_match_runs=2,
+            template_match_present=1,
+            template_match_absent=0,
+            template_match_unknown=1,
+            errors=0,
+        )
+        session = KeyframeDetectionSession(
+            queue.Queue(),
+            None,
+            StableKeyframeDetector(
+                KeyframePolicy(stable_comparisons=1, stable_duration_ms=0)
+            ),
+            icon_recorder=recorder,
+        )
+
+        self.assertIs(session.icon_segmentations, recorder.segmentations)
+        self.assertIs(session.icon_template_matches, recorder.template_matches)
+        template = object()
+        self.assertEqual(
+            session.register_icon_template(template),
+            "displaced-template",
+        )
+        self.assertEqual(registered, [template])
+        stats = session.stats()
+        self.assertEqual(session.icon_segmentation_state, "IDLE")
+        self.assertEqual(stats.icon_segmentation_submitted, 3)
+        self.assertEqual(stats.icon_segmentation_succeeded, 2)
+        self.assertEqual(stats.icon_segmentation_unavailable, 1)
+        self.assertEqual(stats.icon_registered_templates, 1)
+        self.assertEqual(stats.icon_template_match_runs, 2)
+        self.assertEqual(stats.icon_template_match_present, 1)
+        self.assertEqual(stats.icon_template_match_unknown, 1)
+
     def test_icon_recorder_still_observes_frames_while_ocr_is_pending(self) -> None:
         frames = queue.Queue()
         recorder = _RecordingIconRecorder()
@@ -263,9 +402,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
             None,
             StableKeyframeDetector(_ocr_gray_policy()),
             writer=_RecordingWriter(),
-            ocr_session=CandidateOcrSession(
-                recognizer_factory=lambda: recognizer
-            ),
+            ocr_session=CandidateOcrSession(recognizer_factory=lambda: recognizer),
             icon_recorder=recorder,
         )
         session.start()
@@ -321,6 +458,228 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
         self.assertEqual(session.stats().icon_errors, 1)
         self.assertEqual(icon_error.reason_code, "ICON_RECORDER_SUBMIT_FAILED")
 
+    def test_ui_anchor_discovery_receives_frames_in_order_while_ocr_is_pending(
+        self,
+    ) -> None:
+        frames = queue.Queue()
+        discovery = _RecordingUiAnchorDiscovery()
+        recognizer = _BlockingRecognizer()
+        session = KeyframeDetectionSession(
+            frames,
+            None,
+            StableKeyframeDetector(_ocr_gray_policy()),
+            writer=_RecordingWriter(),
+            ocr_session=CandidateOcrSession(recognizer_factory=lambda: recognizer),
+            ui_anchor_discovery=discovery,
+        )
+        session.start()
+        source_frames = list(_base_and_gray_frames())
+        for frame in source_frames:
+            frames.put(frame)
+        self.assertTrue(recognizer.entered.wait(2.0))
+        pending_frame = make_frame(
+            np.full((36, 64, 3), 127, dtype=np.uint8),
+            time_ms=400,
+            frame_number=5,
+        )
+        source_frames.append(pending_frame)
+        frames.put(pending_frame)
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and len(discovery.submitted) < 5:
+            time.sleep(0.01)
+        session.request_stop()
+        self.assertTrue(session.join(timeout=3.0))
+        self.assertEqual(
+            discovery.submitted,
+            [frame.frame_id for frame in source_frames],
+        )
+
+    def test_ui_anchor_output_queues_preserve_component_identity(self) -> None:
+        discovery = _RecordingUiAnchorDiscovery()
+        session = KeyframeDetectionSession(
+            queue.Queue(),
+            None,
+            StableKeyframeDetector(),
+            ui_anchor_discovery=discovery,
+        )
+
+        self.assertIs(session.ui_anchor_events, discovery.events)
+        self.assertIs(session.ui_anchor_candidates, discovery.candidates)
+        self.assertIs(session.ui_anchor_previews, discovery.previews)
+
+    def test_ui_anchor_stats_are_bridged_into_session_stats(self) -> None:
+        discovery = _RecordingUiAnchorDiscovery()
+        discovery.stats = lambda: SimpleNamespace(
+            submitted_frames=17,
+            dropped_frames=2,
+            ignored_frames=3,
+            analyzed_samples=14,
+            motion_qualified_samples=13,
+            eligible_observations=12,
+            motion_episode_count=11,
+            observed_direction_bins=8,
+            maximum_support=41,
+            maximum_translucent_support=29,
+            support_target=50,
+            progress_regions=7,
+            refining_regions=4,
+            promoted_candidates=6,
+            persisted_candidates=5,
+            last_reason_code="MOTION_OBSERVATION_ACCUMULATED",
+            changed_ratio=0.125,
+            mean_difference=9.5,
+            flow_model_inlier_ratio=0.875,
+            moving_flow_perimeter_sides=3,
+            strong_transition=True,
+            errors=4,
+        )
+        session = KeyframeDetectionSession(
+            queue.Queue(),
+            None,
+            StableKeyframeDetector(),
+            ui_anchor_discovery=discovery,
+        )
+
+        stats = session.stats()
+
+        self.assertEqual(stats.ui_anchor_submitted_frames, 17)
+        self.assertEqual(stats.ui_anchor_dropped_frames, 2)
+        self.assertEqual(stats.ui_anchor_ignored_frames, 3)
+        self.assertEqual(stats.ui_anchor_analyzed_samples, 14)
+        self.assertEqual(stats.ui_anchor_motion_qualified_samples, 13)
+        self.assertEqual(stats.ui_anchor_eligible_observations, 12)
+        self.assertEqual(stats.ui_anchor_motion_episodes, 11)
+        self.assertEqual(stats.ui_anchor_direction_bins, 8)
+        self.assertEqual(stats.ui_anchor_maximum_support, 41)
+        self.assertEqual(stats.ui_anchor_maximum_translucent_support, 29)
+        self.assertEqual(stats.ui_anchor_support_target, 50)
+        self.assertEqual(stats.ui_anchor_progress_regions, 7)
+        self.assertEqual(stats.ui_anchor_refining_regions, 4)
+        self.assertEqual(stats.ui_anchor_promoted_candidates, 6)
+        self.assertEqual(stats.ui_anchor_persisted_candidates, 5)
+        self.assertEqual(
+            stats.ui_anchor_last_reason_code,
+            "MOTION_OBSERVATION_ACCUMULATED",
+        )
+        self.assertEqual(stats.ui_anchor_changed_ratio, 0.125)
+        self.assertEqual(stats.ui_anchor_mean_difference, 9.5)
+        self.assertEqual(stats.ui_anchor_flow_model_inlier_ratio, 0.875)
+        self.assertEqual(stats.ui_anchor_moving_flow_perimeter_sides, 3)
+        self.assertTrue(stats.ui_anchor_strong_transition)
+        self.assertEqual(stats.ui_anchor_errors, 4)
+
+    def test_ui_anchor_start_failure_does_not_fail_keyframe_session(self) -> None:
+        frames = queue.Queue()
+        discovery = _RecordingUiAnchorDiscovery(
+            start_error=RuntimeError("anchor worker unavailable")
+        )
+        session = KeyframeDetectionSession(
+            frames,
+            None,
+            StableKeyframeDetector(
+                KeyframePolicy(stable_comparisons=1, stable_duration_ms=0)
+            ),
+            ui_anchor_discovery=discovery,
+        )
+
+        session.start()
+        frames.put(make_frame(50, time_ms=0, frame_number=1))
+        frames.put(make_frame(50, time_ms=100, frame_number=2))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and session.stats().processed_frames < 2:
+            time.sleep(0.01)
+        ui_anchor_error = session.ui_anchor_events.get(timeout=1.0)
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+
+        self.assertEqual(session.stats().processed_frames, 2)
+        self.assertIsNone(session.failure)
+        self.assertEqual(discovery.start_calls, 1)
+        self.assertEqual(discovery.submit_calls, 0)
+        self.assertTrue(discovery.stop_requested)
+        self.assertEqual(session.ui_anchor_state, "DEGRADED")
+        self.assertEqual(session.stats().ui_anchor_errors, 1)
+        self.assertEqual(
+            ui_anchor_error.reason_code,
+            "UI_ANCHOR_DISCOVERY_START_FAILED",
+        )
+
+    def test_ui_anchor_submit_failure_does_not_fail_keyframe_session(self) -> None:
+        frames = queue.Queue()
+        discovery = _RecordingUiAnchorDiscovery(
+            submit_error=RuntimeError("anchor queue unavailable")
+        )
+        session = KeyframeDetectionSession(
+            frames,
+            None,
+            StableKeyframeDetector(
+                KeyframePolicy(stable_comparisons=1, stable_duration_ms=0)
+            ),
+            ui_anchor_discovery=discovery,
+        )
+
+        session.start()
+        frames.put(make_frame(50, time_ms=0, frame_number=1))
+        frames.put(make_frame(50, time_ms=100, frame_number=2))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and session.stats().processed_frames < 2:
+            time.sleep(0.01)
+        ui_anchor_error = session.ui_anchor_events.get(timeout=1.0)
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+
+        self.assertEqual(session.stats().processed_frames, 2)
+        self.assertIsNone(session.failure)
+        self.assertEqual(discovery.submit_calls, 1)
+        self.assertTrue(discovery.stop_requested)
+        self.assertEqual(session.ui_anchor_state, "DEGRADED")
+        self.assertEqual(session.stats().ui_anchor_errors, 1)
+        self.assertEqual(
+            ui_anchor_error.reason_code,
+            "UI_ANCHOR_DISCOVERY_SUBMIT_FAILED",
+        )
+
+    def test_ui_anchor_false_submit_latches_without_overriding_terminal_state(
+        self,
+    ) -> None:
+        discovery = _RecordingUiAnchorDiscovery(submit_result=False)
+        discovery.state = "RESOURCE_LIMIT_REACHED"
+        session = KeyframeDetectionSession(
+            queue.Queue(),
+            None,
+            StableKeyframeDetector(),
+            ui_anchor_discovery=discovery,
+        )
+        first = make_frame(50, time_ms=0, frame_number=1)
+        second = make_frame(50, time_ms=100, frame_number=2)
+
+        session._submit_ui_anchor_frame(first)
+        session._submit_ui_anchor_frame(second)
+
+        self.assertEqual(discovery.submit_calls, 1)
+        self.assertEqual(session.ui_anchor_state, "RESOURCE_LIMIT_REACHED")
+        self.assertEqual(session.stats().ui_anchor_errors, 0)
+        self.assertTrue(session.ui_anchor_events.empty())
+
+    def test_ui_anchor_state_reports_disabled_and_component_state(self) -> None:
+        disabled = KeyframeDetectionSession(
+            queue.Queue(),
+            None,
+            StableKeyframeDetector(),
+        )
+        self.assertEqual(disabled.ui_anchor_state, "DISABLED")
+
+        discovery = _RecordingUiAnchorDiscovery()
+        discovery.state = SimpleNamespace(value="ACCUMULATING")
+        enabled = KeyframeDetectionSession(
+            queue.Queue(),
+            None,
+            StableKeyframeDetector(),
+            ui_anchor_discovery=discovery,
+        )
+        self.assertEqual(enabled.ui_anchor_state, "ACCUMULATING")
+
     def test_child_stop_is_broadcast_before_any_child_join(self) -> None:
         order = []
 
@@ -339,16 +698,23 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
 
             @staticmethod
             def assert_all_stopped() -> None:
-                if order[:2] != ["stop:ocr", "stop:icon"]:
+                if order[:3] != ["stop:ocr", "stop:icon", "stop:ui-anchor"]:
                     raise AssertionError("children were not stopped before joining")
 
         KeyframeDetectionSession._stop_components(
-            (_Child("ocr"), _Child("icon")),
+            (_Child("ocr"), _Child("icon"), _Child("ui-anchor")),
             timeout=0.1,
         )
         self.assertEqual(
             order,
-            ["stop:ocr", "stop:icon", "join:ocr", "join:icon"],
+            [
+                "stop:ocr",
+                "stop:icon",
+                "stop:ui-anchor",
+                "join:ocr",
+                "join:icon",
+                "join:ui-anchor",
+            ],
         )
 
     def test_worker_persists_only_a_new_stable_candidate(self) -> None:
@@ -618,9 +984,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
             None,
             StableKeyframeDetector(_ocr_gray_policy()),
             writer=writer,
-            ocr_session=CandidateOcrSession(
-                recognizer_factory=lambda: recognizer
-            ),
+            ocr_session=CandidateOcrSession(recognizer_factory=lambda: recognizer),
         )
         session.start()
         for frame in (first, second, third, fourth):
@@ -660,9 +1024,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
             None,
             StableKeyframeDetector(_ocr_gray_policy()),
             writer=writer,
-            ocr_session=CandidateOcrSession(
-                recognizer_factory=lambda: recognizer
-            ),
+            ocr_session=CandidateOcrSession(recognizer_factory=lambda: recognizer),
         )
         session.start()
         for frame in (first, second, third, fourth):
@@ -694,9 +1056,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
             None,
             StableKeyframeDetector(_ocr_gray_policy()),
             writer=writer,
-            ocr_session=CandidateOcrSession(
-                recognizer_factory=lambda: recognizer
-            ),
+            ocr_session=CandidateOcrSession(recognizer_factory=lambda: recognizer),
         )
         session.start()
         for frame in _base_and_gray_frames():
@@ -731,13 +1091,9 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
         session = KeyframeDetectionSession(
             frames,
             statuses,
-            StableKeyframeDetector(
-                replace(_ocr_gray_policy(), quiet_confirm_ms=1)
-            ),
+            StableKeyframeDetector(replace(_ocr_gray_policy(), quiet_confirm_ms=1)),
             writer=writer,
-            ocr_session=CandidateOcrSession(
-                recognizer_factory=lambda: recognizer
-            ),
+            ocr_session=CandidateOcrSession(recognizer_factory=lambda: recognizer),
         )
         session.start()
         for frame in _base_and_gray_frames(backend="wgc"):
@@ -755,9 +1111,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
             SimpleNamespace(
                 state="WAITING",
                 error_code="TIMEOUT",
-                occurred_at_monotonic_ns=(
-                    next_scene.captured_at_monotonic_ns + 1
-                ),
+                occurred_at_monotonic_ns=(next_scene.captured_at_monotonic_ns + 1),
             )
         )
         recognizer.release.set()

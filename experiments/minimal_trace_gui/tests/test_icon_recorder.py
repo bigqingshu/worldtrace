@@ -7,12 +7,17 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
 import numpy as np
 from PIL import Image
 
+from experiments.minimal_trace_gui.icon_change_gate import (
+    IconChangeGate,
+    IconChangeGatePolicy,
+)
 from experiments.minimal_trace_gui.icon_catalog import (
     IconCatalogPolicy,
     IconResourceLimitError,
@@ -30,6 +35,11 @@ from experiments.minimal_trace_gui.icon_recorder import (
 from experiments.minimal_trace_gui.icon_store import (
     IconCandidateArtifact,
     IconCandidateStore,
+)
+from experiments.minimal_trace_gui.icon_template_matcher import (
+    IconPresence,
+    IconTemplateMatchResult,
+    PositionConstrainedIconMatcher,
 )
 
 from .helpers import make_frame
@@ -490,10 +500,7 @@ class FixedHudIconDetectorTests(unittest.TestCase):
 
         self.assertEqual(len(matches), 2)
         self.assertEqual(
-            {
-                (old.bbox, new.bbox)
-                for old, new in matches
-            },
+            {(old.bbox, new.bbox) for old, new in matches},
             {
                 (previous[0].bbox, current[0].bbox),
                 (previous[1].bbox, current[1].bbox),
@@ -683,12 +690,8 @@ class IconCandidateStoreTests(unittest.TestCase):
                     max_unique_candidates=None,
                 ),
             ).save(candidate)
-            metadata = json.loads(
-                artifact.metadata_path.read_text(encoding="utf-8")
-            )
-            self.assertIsNone(
-                metadata["recorder"]["max_records_per_session"]
-            )
+            metadata = json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
+            self.assertIsNone(metadata["recorder"]["max_records_per_session"])
             self.assertEqual(
                 metadata["recorder"]["record_limit_mode"],
                 "UNLIMITED",
@@ -760,6 +763,71 @@ class _RecordingIconWriter:
         if self.error is not None:
             raise self.error
         return IconCandidateArtifact(Path("crop.png"), Path("metadata.json"))
+
+
+class _RecordingSegmentationSession:
+    def __init__(self) -> None:
+        self.results = queue.Queue()
+        self.submissions = []
+        self.is_alive = False
+        self.failure = None
+        self.state = "CREATED"
+
+    def stats(self):
+        return SimpleNamespace(
+            submitted=len(self.submissions),
+            succeeded=0,
+            unavailable=0,
+            failed=0,
+            unknown=0,
+        )
+
+    def start(self) -> None:
+        self.is_alive = True
+        self.state = "IDLE"
+
+    def submit(self, candidate, source_artifact=None):
+        request = SimpleNamespace(
+            candidate=candidate,
+            source_artifact=source_artifact,
+        )
+        self.submissions.append(request)
+        return request
+
+    def request_stop(self) -> None:
+        self.is_alive = False
+        self.state = "STOPPED"
+
+    def join(self, timeout=None) -> bool:
+        del timeout
+        return not self.is_alive
+
+
+class _RecordingTemplateMatcher(PositionConstrainedIconMatcher):
+    def __init__(self, result: IconTemplateMatchResult) -> None:
+        super().__init__()
+        self.result = result
+        self.calls = []
+
+    def match(
+        self,
+        frame,
+        template_rgb,
+        recognition_mask,
+        *,
+        normalized_center,
+        normalized_size,
+    ):
+        self.calls.append(
+            (
+                frame.copy(),
+                template_rgb,
+                recognition_mask,
+                normalized_center,
+                normalized_size,
+            )
+        )
+        return self.result
 
 
 class _SequenceDetector:
@@ -844,6 +912,306 @@ class _PendingBatchDetector:
 
 
 class IconRecorderSessionTests(unittest.TestCase):
+    def test_successful_persistence_submits_same_candidate_and_artifact_to_sam(
+        self,
+    ) -> None:
+        candidate = _confirmed_candidate()
+        detector = _OneCandidateDetector(candidate)
+        writer = _RecordingIconWriter()
+        segmentation = _RecordingSegmentationSession()
+        session = IconRecorderSession(
+            detector,  # type: ignore[arg-type]
+            writer,
+            segmentation_session=segmentation,
+        )
+
+        session.start()
+        session.submit(make_frame(10, time_ms=0, frame_number=1))
+        self._wait_until(lambda: len(segmentation.submissions) == 1)
+
+        request = segmentation.submissions[0]
+        self.assertIs(request.candidate, candidate)
+        self.assertIsInstance(request.source_artifact, IconCandidateArtifact)
+        self.assertEqual(session.stats().segmentation_submitted, 1)
+        self.assertEqual(session.stats().segmentation_state, "IDLE")
+
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+        self.assertFalse(segmentation.is_alive)
+
+    def test_failed_persistence_never_submits_candidate_to_sam(self) -> None:
+        candidate = _confirmed_candidate()
+        segmentation = _RecordingSegmentationSession()
+        session = IconRecorderSession(
+            _OneCandidateDetector(candidate),  # type: ignore[arg-type]
+            _RecordingIconWriter(error=OSError("disk failed")),
+            segmentation_session=segmentation,
+        )
+
+        session.start()
+        session.submit(make_frame(10, time_ms=0, frame_number=1))
+        self._wait_until(lambda: session.state == "DEGRADED")
+        self.assertEqual(segmentation.submissions, [])
+
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+
+    def test_templates_match_once_only_after_one_change_epoch_becomes_quiet(
+        self,
+    ) -> None:
+        class _GateProbeDetector:
+            def __init__(self) -> None:
+                self.policy = IconRecorderPolicy(
+                    sample_interval_ms=100,
+                    max_sample_gap_ms=500,
+                )
+                self.calls = 0
+
+            def observe_frame(self, frame):
+                del frame
+                self.calls += 1
+                return IconDetectorResult("TRACKING")
+
+            def reset_tracking(self) -> None:
+                return None
+
+            def scope_id_for_frame(self, frame) -> str:
+                del frame
+                return "scope-1"
+
+            def stats(self) -> IconDetectorStats:
+                return IconDetectorStats(analyzed_samples=self.calls)
+
+            def abort_pending(self) -> None:
+                return None
+
+        gate = IconChangeGate(
+            IconChangeGatePolicy(
+                analysis_width=8,
+                analysis_height=8,
+                spatial_grid_columns=2,
+                spatial_grid_rows=2,
+                normal_minimum_active_cells=2,
+                normal_consecutive_samples=1,
+                quiet_consecutive_samples=1,
+                active_scan_min_ms=100,
+                active_scan_max_ms=500,
+                cooldown_ms=1_000,
+                detector_hit_cooldown_ms=1_000,
+                max_sample_gap_ms=500,
+            )
+        )
+        match_result = IconTemplateMatchResult(
+            status=IconPresence.PRESENT,
+            reason_code="TEST_PRESENT",
+            score=0.99,
+            bbox=(1, 1, 3, 3),
+            center=(2.0, 2.0),
+            normalized_center=(0.25, 0.25),
+            scale_factor=1.0,
+            evaluations=1,
+        )
+        matcher = _RecordingTemplateMatcher(match_result)
+        detector = _GateProbeDetector()
+        session = IconRecorderSession(
+            detector,  # type: ignore[arg-type]
+            _RecordingIconWriter(),
+            change_gate=gate,
+            template_matcher=matcher,
+        )
+        template_rgb = np.full((2, 2, 3), 255, dtype=np.uint8)
+        recognition_mask = np.full((2, 2), 255, dtype=np.uint8)
+        session.register_template(
+            SimpleNamespace(
+                template_id="hud-template-test",
+                scope_id="scope-1",
+                template_rgb=template_rgb,
+                recognition_mask=recognition_mask,
+                normalized_center=(0.25, 0.25),
+                normalized_size=(0.25, 0.25),
+            )
+        )
+
+        session.start()
+        for expected_samples, frame in enumerate(
+            (
+                make_frame(10, time_ms=0, frame_number=1),
+                make_frame(10, time_ms=100, frame_number=2),
+                make_frame(255, time_ms=200, frame_number=3),
+                make_frame(255, time_ms=300, frame_number=4),
+                make_frame(255, time_ms=400, frame_number=5),
+            ),
+            start=1,
+        ):
+            session.submit(frame)
+            self._wait_until(
+                lambda expected_samples=expected_samples: (
+                    session.stats().gate_samples >= expected_samples
+                )
+            )
+
+        self._wait_until(lambda: len(matcher.calls) == 1)
+        event = session.template_matches.get_nowait()
+        self.assertIs(event.result.status, IconPresence.PRESENT)
+        self.assertEqual(event.change_epoch, 1)
+        self.assertEqual(event.template_id, "hud-template-test")
+        self.assertEqual(session.stats().template_match_runs, 1)
+        self.assertEqual(session.stats().template_match_present, 1)
+
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+
+    def test_change_gate_keeps_static_frames_out_of_the_lk_detector(self) -> None:
+        class _GateProbeDetector:
+            def __init__(self) -> None:
+                self.policy = IconRecorderPolicy(
+                    sample_interval_ms=100,
+                    max_sample_gap_ms=500,
+                )
+                self.calls = 0
+                self.reset_calls = 0
+
+            def observe_frame(self, frame):
+                del frame
+                self.calls += 1
+                return IconDetectorResult("TRACKING")
+
+            def reset_tracking(self) -> None:
+                self.reset_calls += 1
+
+            def stats(self) -> IconDetectorStats:
+                return IconDetectorStats(analyzed_samples=self.calls)
+
+            def abort_pending(self) -> None:
+                return None
+
+        detector = _GateProbeDetector()
+        gate = IconChangeGate(
+            IconChangeGatePolicy(
+                analysis_width=8,
+                analysis_height=8,
+                spatial_grid_columns=2,
+                spatial_grid_rows=2,
+                normal_minimum_active_cells=2,
+                normal_consecutive_samples=1,
+                quiet_consecutive_samples=1,
+                active_scan_min_ms=100,
+                active_scan_max_ms=300,
+                cooldown_ms=100,
+                detector_hit_cooldown_ms=100,
+                max_sample_gap_ms=500,
+            )
+        )
+        session = IconRecorderSession(
+            detector,  # type: ignore[arg-type]
+            _RecordingIconWriter(),
+            change_gate=gate,
+        )
+        session.start()
+        session.submit(make_frame(10, time_ms=0, frame_number=1))
+        self._wait_until(lambda: session.stats().gate_samples >= 1)
+        session.submit(make_frame(10, time_ms=100, frame_number=2))
+        self._wait_until(lambda: session.stats().gate_state == "IDLE")
+
+        self.assertEqual(detector.calls, 0)
+        self.assertGreaterEqual(detector.reset_calls, 1)
+        stats = session.stats()
+        self.assertEqual(stats.gate_wakeups, 0)
+        self.assertEqual(stats.gate_active_samples, 0)
+        self.assertGreaterEqual(stats.gate_idle_skips, 2)
+
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+
+    def test_strong_change_opens_one_bounded_scan_and_resets_tracking(self) -> None:
+        class _GateProbeDetector:
+            def __init__(self) -> None:
+                self.policy = IconRecorderPolicy(
+                    sample_interval_ms=100,
+                    max_sample_gap_ms=500,
+                )
+                self.calls = 0
+                self.reset_calls = 0
+
+            def observe_frame(self, frame):
+                del frame
+                self.calls += 1
+                return IconDetectorResult("TRACKING")
+
+            def reset_tracking(self) -> None:
+                self.reset_calls += 1
+
+            def stats(self) -> IconDetectorStats:
+                return IconDetectorStats(analyzed_samples=self.calls)
+
+            def abort_pending(self) -> None:
+                return None
+
+        detector = _GateProbeDetector()
+        gate = IconChangeGate(
+            IconChangeGatePolicy(
+                analysis_width=8,
+                analysis_height=8,
+                spatial_grid_columns=2,
+                spatial_grid_rows=2,
+                normal_minimum_active_cells=2,
+                normal_consecutive_samples=1,
+                quiet_consecutive_samples=1,
+                active_scan_min_ms=250,
+                active_scan_max_ms=300,
+                cooldown_ms=100,
+                detector_hit_cooldown_ms=100,
+                max_sample_gap_ms=500,
+            )
+        )
+        session = IconRecorderSession(
+            detector,  # type: ignore[arg-type]
+            _RecordingIconWriter(),
+            change_gate=gate,
+        )
+        session.start()
+        session.submit(make_frame(10, time_ms=0, frame_number=1))
+        self._wait_until(lambda: session.stats().gate_samples >= 1)
+        session.submit(make_frame(10, time_ms=100, frame_number=2))
+        self._wait_until(lambda: session.stats().gate_state == "IDLE")
+        resets_before_wake = detector.reset_calls
+
+        session.submit(make_frame(255, time_ms=200, frame_number=3))
+        self._wait_until(lambda: detector.calls >= 1)
+        self.assertEqual(session.stats().gate_state, "ACTIVE_SCAN")
+        self.assertEqual(session.stats().gate_wakeups, 1)
+        self.assertEqual(detector.reset_calls, resets_before_wake + 1)
+
+        session.submit(make_frame(255, time_ms=300, frame_number=4))
+        self._wait_until(lambda: detector.calls >= 2)
+        session.submit(make_frame(255, time_ms=500, frame_number=5))
+        self._wait_until(lambda: session.stats().gate_state == "COOLDOWN")
+        self.assertEqual(session.stats().gate_scan_timeouts, 1)
+        self.assertEqual(detector.calls, 2)
+
+        transitions = []
+        while True:
+            try:
+                event = session.events.get_nowait()
+            except queue.Empty:
+                break
+            if event.status is IconRecordStatus.GATE_TRANSITION:
+                transitions.append(event.reason_code)
+        self.assertIn("STRONG_PAIR_AND_ANCHOR", transitions)
+        self.assertIn("ACTIVE_SCAN_TIMEOUT", transitions)
+
+        session.request_stop()
+        self.assertTrue(session.join(timeout=1.0))
+
+    @staticmethod
+    def _wait_until(predicate, timeout: float = 1.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.005)
+        raise AssertionError("condition was not reached before timeout")
+
     def test_worker_stops_only_when_configured_limit_is_reached(self) -> None:
         candidate = _confirmed_candidate()
         detector = _OneCandidateDetector(candidate)
@@ -886,9 +1254,7 @@ class IconRecorderSessionTests(unittest.TestCase):
             ),
         )
         session.start()
-        self.assertTrue(
-            session.submit(make_frame(10, time_ms=0, frame_number=1))
-        )
+        self.assertTrue(session.submit(make_frame(10, time_ms=0, frame_number=1)))
         first_event = session.events.get(timeout=2.0)
         self.assertEqual(first_event.status, IconRecordStatus.RECORDED)
         second_event = session.events.get(timeout=2.0)
@@ -930,12 +1296,9 @@ class IconRecorderSessionTests(unittest.TestCase):
         )
         session.start()
 
-        self.assertTrue(
-            session.submit(make_frame(0, time_ms=0, frame_number=1))
-        )
+        self.assertTrue(session.submit(make_frame(0, time_ms=0, frame_number=1)))
         observed_statuses = [
-            session.events.get(timeout=2.0).status
-            for _index in range(4)
+            session.events.get(timeout=2.0).status for _index in range(4)
         ]
 
         self.assertTrue(session.join(timeout=1.0))

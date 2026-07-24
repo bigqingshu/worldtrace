@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from numbers import Real
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -88,6 +90,67 @@ class AdvancedTraceSettings:
     icon_confirmation_iou: float = 0.35
     icon_confirmation_center_distance_px: float = 6.0
     icon_crop_padding_px: int = 6
+    icon_change_gate_enabled: bool = True
+    icon_change_pixel_delta_threshold: int = 12
+    icon_change_normal_ratio: float = 0.06
+    icon_change_normal_mean_difference: float = 1.50
+    icon_change_normal_samples: int = 2
+    icon_change_minimum_active_cells: int = 6
+    icon_change_strong_ratio: float = 0.15
+    icon_change_strong_mean_difference: float = 8.0
+    icon_change_quiet_ratio: float = 0.01
+    icon_change_quiet_mean_difference: float = 0.50
+    icon_change_quiet_samples: int = 3
+    icon_change_active_min_ms: int = 3_200
+    icon_change_active_max_ms: int = 4_500
+    icon_change_cooldown_ms: int = 1_500
+    icon_change_hit_cooldown_ms: int = 5_000
+    icon_change_max_sample_gap_ms: int = 1_000
+    icon_sam_enabled: bool = True
+    icon_sam_device: str = "cuda:1"
+    icon_sam_timeout_s: float = 45.0
+    icon_template_matching_enabled: bool = True
+    icon_template_max_active: int = 8
+    icon_match_search_radius_normalized: float = 0.03
+    icon_match_search_step_px: int = 4
+    icon_match_absent_score_threshold: float = 0.55
+    icon_match_present_score_threshold: float = 0.88
+    ui_anchor_support_target: int = 50
+    ui_anchor_sample_interval_ms: int = 100
+    ui_anchor_max_sample_gap_ms: int = 1_000
+    ui_anchor_maximum_evidence_gap_ms: int = 300_000
+    ui_anchor_stable_pixel_delta: int = 6
+    ui_anchor_changed_pixel_delta: int = 12
+    ui_anchor_minimum_changed_ratio: float = 0.08
+    ui_anchor_minimum_mean_difference: float = 1.50
+    ui_anchor_strong_changed_ratio: float = 0.20
+    ui_anchor_minimum_motion_grid_cells: int = 5
+    ui_anchor_minimum_flow_tracks: int = 30
+    ui_anchor_flow_motion_threshold_px: float = 1.0
+    ui_anchor_minimum_flow_moving_ratio: float = 0.25
+    ui_anchor_minimum_flow_model_inlier_ratio: float = 0.45
+    ui_anchor_minimum_flow_grid_cells: int = 4
+    ui_anchor_minimum_flow_perimeter_sides: int = 4
+    ui_anchor_quiet_samples_to_close_episode: int = 3
+    ui_anchor_edge_threshold: int = 48
+    ui_anchor_motion_context_radius_px: int = 12
+    ui_anchor_vote_dilation_px: int = 1
+    ui_anchor_minimum_core_pixels: int = 8
+    ui_anchor_minimum_candidate_side_px: int = 4
+    ui_anchor_maximum_candidate_area_ratio: float = 0.20
+    ui_anchor_minimum_support_ratio: float = 0.90
+    ui_anchor_minimum_motion_episodes: int = 2
+    ui_anchor_minimum_motion_direction_bins: int = 2
+    ui_anchor_maximum_candidates: int = 32
+    ui_anchor_translucent_enabled: bool = True
+    ui_anchor_translucent_edge_threshold: int = 24
+    ui_anchor_translucent_orientation_similarity: float = 0.85
+    ui_anchor_translucent_max_local_change_ratio: float = 0.80
+    ui_anchor_translucent_minimum_support_ratio: float = 0.60
+    ui_anchor_refinement_enabled: bool = True
+    ui_anchor_refinement_max_observations: int = 20
+    ui_anchor_refinement_no_growth_observations: int = 5
+    ui_anchor_refinement_expansion_radius_px: int = 4
 
     _MAX_SIGNATURE_BYTES = 128 * 1024 * 1024
 
@@ -123,6 +186,36 @@ class AdvancedTraceSettings:
             "icon_minimum_candidate_side_px",
             "icon_minimum_context_moving_tracks",
             "icon_crop_padding_px",
+            "icon_change_normal_samples",
+            "icon_change_minimum_active_cells",
+            "icon_change_quiet_samples",
+            "icon_change_active_min_ms",
+            "icon_change_active_max_ms",
+            "icon_change_cooldown_ms",
+            "icon_change_hit_cooldown_ms",
+            "icon_change_max_sample_gap_ms",
+            "icon_template_max_active",
+            "icon_match_search_step_px",
+            "ui_anchor_support_target",
+            "ui_anchor_sample_interval_ms",
+            "ui_anchor_max_sample_gap_ms",
+            "ui_anchor_maximum_evidence_gap_ms",
+            "ui_anchor_minimum_motion_grid_cells",
+            "ui_anchor_minimum_flow_tracks",
+            "ui_anchor_minimum_flow_grid_cells",
+            "ui_anchor_minimum_flow_perimeter_sides",
+            "ui_anchor_quiet_samples_to_close_episode",
+            "ui_anchor_edge_threshold",
+            "ui_anchor_motion_context_radius_px",
+            "ui_anchor_minimum_core_pixels",
+            "ui_anchor_minimum_candidate_side_px",
+            "ui_anchor_minimum_motion_episodes",
+            "ui_anchor_minimum_motion_direction_bins",
+            "ui_anchor_maximum_candidates",
+            "ui_anchor_translucent_edge_threshold",
+            "ui_anchor_refinement_max_observations",
+            "ui_anchor_refinement_no_growth_observations",
+            "ui_anchor_refinement_expansion_radius_px",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -135,22 +228,27 @@ class AdvancedTraceSettings:
         for name in (
             "icon_near_visual_dedup_enabled",
             "icon_same_slot_dedup_enabled",
+            "icon_change_gate_enabled",
+            "icon_sam_enabled",
+            "icon_template_matching_enabled",
+            "ui_anchor_translucent_enabled",
+            "ui_anchor_refinement_enabled",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be boolean")
+        if self.icon_sam_device not in {"cpu", "cuda:0", "cuda:1"}:
+            raise ValueError("icon_sam_device must be cpu, cuda:0, or cuda:1")
         if self.icon_max_unique_candidates is not None:
-            if (
-                isinstance(self.icon_max_unique_candidates, bool)
-                or not isinstance(self.icon_max_unique_candidates, int)
+            if isinstance(self.icon_max_unique_candidates, bool) or not isinstance(
+                self.icon_max_unique_candidates, int
             ):
                 raise TypeError("icon_max_unique_candidates must be an integer or None")
             if not 1 <= self.icon_max_unique_candidates <= 1_000:
                 raise ValueError(
                     "icon_max_unique_candidates must be inside 1..1000 or None"
                 )
-        if (
-            isinstance(self.icon_visual_phash_distance, bool)
-            or not isinstance(self.icon_visual_phash_distance, int)
+        if isinstance(self.icon_visual_phash_distance, bool) or not isinstance(
+            self.icon_visual_phash_distance, int
         ):
             raise TypeError("icon_visual_phash_distance must be an integer")
         if not 0 <= self.icon_visual_phash_distance <= 64:
@@ -177,15 +275,58 @@ class AdvancedTraceSettings:
             "ocr_bbox_iou_threshold",
             "icon_visual_normalized_mae",
             "icon_same_slot_iou",
+            "icon_change_normal_ratio",
+            "icon_change_strong_ratio",
+            "icon_change_quiet_ratio",
+            "icon_match_search_radius_normalized",
+            "icon_match_absent_score_threshold",
+            "icon_match_present_score_threshold",
+            "ui_anchor_minimum_changed_ratio",
+            "ui_anchor_strong_changed_ratio",
+            "ui_anchor_minimum_flow_moving_ratio",
+            "ui_anchor_minimum_flow_model_inlier_ratio",
+            "ui_anchor_maximum_candidate_area_ratio",
+            "ui_anchor_minimum_support_ratio",
+            "ui_anchor_translucent_orientation_similarity",
+            "ui_anchor_translucent_max_local_change_ratio",
+            "ui_anchor_translucent_minimum_support_ratio",
         ):
             value = getattr(self, name)
-            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+            ):
+                raise TypeError(f"{name} must be a finite real number")
+            if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"{name} must be finite and inside 0..1")
-        for name in ("stable_mean_difference", "depart_mean_difference"):
+        for name in (
+            "stable_mean_difference",
+            "depart_mean_difference",
+            "icon_change_normal_mean_difference",
+            "icon_change_strong_mean_difference",
+            "icon_change_quiet_mean_difference",
+            "ui_anchor_minimum_mean_difference",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        for name in ("ocr_response_timeout_s", "ocr_candidate_timeout_s"):
+        for name in (
+            "icon_change_normal_mean_difference",
+            "icon_change_strong_mean_difference",
+            "icon_change_quiet_mean_difference",
+        ):
+            if getattr(self, name) > 255.0:
+                raise ValueError(f"{name} cannot exceed 255")
+        for name in ("ui_anchor_flow_motion_threshold_px",):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        for name in (
+            "ocr_response_timeout_s",
+            "ocr_candidate_timeout_s",
+            "icon_sam_timeout_s",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -198,6 +339,145 @@ class AdvancedTraceSettings:
             raise ValueError(
                 "icon_max_sample_gap_ms cannot be shorter than the sample interval"
             )
+        if isinstance(self.icon_change_pixel_delta_threshold, bool) or not isinstance(
+            self.icon_change_pixel_delta_threshold, int
+        ):
+            raise TypeError("icon_change_pixel_delta_threshold must be an integer")
+        if not 0 <= self.icon_change_pixel_delta_threshold <= 255:
+            raise ValueError("icon_change_pixel_delta_threshold must be inside 0..255")
+        if self.icon_change_minimum_active_cells > 12:
+            raise ValueError(
+                "icon_change_minimum_active_cells cannot exceed the fixed 4x3 grid"
+            )
+        if (
+            self.icon_change_normal_samples > 100
+            or self.icon_change_quiet_samples > 100
+        ):
+            raise ValueError("icon change consecutive sample counts cannot exceed 100")
+        for name in (
+            "icon_change_active_min_ms",
+            "icon_change_active_max_ms",
+            "icon_change_cooldown_ms",
+            "icon_change_hit_cooldown_ms",
+            "icon_change_max_sample_gap_ms",
+        ):
+            if getattr(self, name) > 60_000:
+                raise ValueError(f"{name} cannot exceed 60000 ms")
+        if self.icon_change_strong_ratio < self.icon_change_normal_ratio:
+            raise ValueError(
+                "icon_change_strong_ratio cannot be smaller than normal ratio"
+            )
+        if (
+            self.icon_change_strong_mean_difference
+            < self.icon_change_normal_mean_difference
+        ):
+            raise ValueError(
+                "icon_change_strong_mean_difference cannot be smaller "
+                "than normal mean difference"
+            )
+        if self.icon_change_quiet_ratio > self.icon_change_normal_ratio:
+            raise ValueError("icon_change_quiet_ratio cannot exceed normal ratio")
+        if (
+            self.icon_change_quiet_mean_difference
+            > self.icon_change_normal_mean_difference
+        ):
+            raise ValueError(
+                "icon_change_quiet_mean_difference cannot exceed normal mean difference"
+            )
+        if self.icon_change_active_min_ms > self.icon_change_active_max_ms:
+            raise ValueError("icon_change_active_min_ms cannot exceed active max")
+        if self.icon_change_max_sample_gap_ms < self.icon_sample_interval_ms:
+            raise ValueError(
+                "icon_change_max_sample_gap_ms cannot be shorter than "
+                "the icon sample interval"
+            )
+        if (
+            self.icon_match_absent_score_threshold
+            >= self.icon_match_present_score_threshold
+        ):
+            raise ValueError(
+                "icon match absent threshold must be smaller than the present threshold"
+            )
+        if self.icon_template_max_active > 32:
+            raise ValueError("icon_template_max_active cannot exceed 32")
+        if self.icon_match_search_step_px > 64:
+            raise ValueError("icon_match_search_step_px cannot exceed 64")
+        if self.icon_match_search_radius_normalized > 0.5:
+            raise ValueError("icon_match_search_radius_normalized cannot exceed 0.5")
+        if self.icon_template_matching_enabled and not self.icon_change_gate_enabled:
+            raise ValueError("icon template matching requires the icon change gate")
+        for name in (
+            "ui_anchor_stable_pixel_delta",
+            "ui_anchor_changed_pixel_delta",
+            "ui_anchor_vote_dilation_px",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+        if not (
+            0
+            <= self.ui_anchor_stable_pixel_delta
+            <= self.ui_anchor_changed_pixel_delta
+            <= 255
+        ):
+            raise ValueError(
+                "UI anchor pixel thresholds require 0 <= stable <= changed <= 255"
+            )
+        if not 0 <= self.ui_anchor_vote_dilation_px <= 4:
+            raise ValueError("ui_anchor_vote_dilation_px must be inside 0..4")
+        if self.ui_anchor_max_sample_gap_ms < self.ui_anchor_sample_interval_ms:
+            raise ValueError(
+                "ui_anchor_max_sample_gap_ms cannot be shorter than sample interval"
+            )
+        if self.ui_anchor_maximum_evidence_gap_ms < self.ui_anchor_max_sample_gap_ms:
+            raise ValueError(
+                "ui_anchor_maximum_evidence_gap_ms cannot be shorter than "
+                "ui_anchor_max_sample_gap_ms"
+            )
+        if self.ui_anchor_maximum_evidence_gap_ms > 3_600_000:
+            raise ValueError("ui_anchor_maximum_evidence_gap_ms cannot exceed one hour")
+        if self.ui_anchor_support_target > 10_000:
+            raise ValueError("ui_anchor_support_target cannot exceed 10000")
+        if self.ui_anchor_minimum_motion_grid_cells > 12:
+            raise ValueError(
+                "ui_anchor_minimum_motion_grid_cells cannot exceed the fixed 4x3 grid"
+            )
+        if self.ui_anchor_minimum_flow_grid_cells > 12:
+            raise ValueError(
+                "ui_anchor_minimum_flow_grid_cells cannot exceed the fixed 4x3 grid"
+            )
+        if self.ui_anchor_minimum_flow_perimeter_sides > 4:
+            raise ValueError("ui_anchor_minimum_flow_perimeter_sides cannot exceed 4")
+        if self.ui_anchor_minimum_motion_direction_bins > 8:
+            raise ValueError("ui_anchor_minimum_motion_direction_bins cannot exceed 8")
+        if self.ui_anchor_motion_context_radius_px > 64:
+            raise ValueError("ui_anchor_motion_context_radius_px cannot exceed 64")
+        if self.ui_anchor_maximum_candidates > 128:
+            raise ValueError("ui_anchor_maximum_candidates cannot exceed 128")
+        if self.ui_anchor_translucent_edge_threshold > 255:
+            raise ValueError(
+                "ui_anchor_translucent_edge_threshold cannot exceed 255"
+            )
+        if self.ui_anchor_refinement_max_observations > 500:
+            raise ValueError(
+                "ui_anchor_refinement_max_observations cannot exceed 500"
+            )
+        if (
+            self.ui_anchor_refinement_no_growth_observations
+            > self.ui_anchor_refinement_max_observations
+        ):
+            raise ValueError(
+                "ui_anchor_refinement_no_growth_observations cannot exceed "
+                "ui_anchor_refinement_max_observations"
+            )
+        if self.ui_anchor_refinement_expansion_radius_px > 16:
+            raise ValueError(
+                "ui_anchor_refinement_expansion_radius_px cannot exceed 16"
+            )
+        if self.ui_anchor_strong_changed_ratio < self.ui_anchor_minimum_changed_ratio:
+            raise ValueError(
+                "UI anchor strong change ratio cannot be below minimum change ratio"
+            )
         if self.icon_canvas_width * self.icon_canvas_height > 640 * 360:
             raise ValueError("icon analysis canvas exceeds the 640x360 pixel budget")
         if self.icon_sample_interval_ms < 100:
@@ -207,9 +487,7 @@ class AdvancedTraceSettings:
         if self.icon_cluster_radius_px > 16.0:
             raise ValueError("icon_cluster_radius_px cannot exceed 16 pixels")
         if self.icon_minimum_valid_tracks > self.icon_max_corners:
-            raise ValueError(
-                "icon_minimum_valid_tracks cannot exceed icon_max_corners"
-            )
+            raise ValueError("icon_minimum_valid_tracks cannot exceed icon_max_corners")
         if self.icon_minimum_context_moving_tracks > self.icon_max_corners:
             raise ValueError(
                 "icon_minimum_context_moving_tracks cannot exceed icon_max_corners"
@@ -275,8 +553,21 @@ class AdvancedTraceSettings:
             f"置信度 {self.ocr_minimum_confidence:.0%}；"
             f"HUD {self.icon_canvas_width}×{self.icon_canvas_height} / "
             f"{1000 / self.icon_sample_interval_ms:.1f} Hz / 候选 {icon_limit}；"
+            f"变化门控={'开' if self.icon_change_gate_enabled else '关'} / "
+            f"SAM={'开' if self.icon_sam_enabled else '关'} / "
+            f"模板核验={'开' if self.icon_template_matching_enabled else '关'}；"
             f"近似视觉去重={'开' if self.icon_near_visual_dedup_enabled else '关'} / "
-            f"同点位去重={'开' if self.icon_same_slot_dedup_enabled else '关'}"
+            f"同点位去重={'开' if self.icon_same_slot_dedup_enabled else '关'}；"
+            f"UI锚点 320×180 / {self.ui_anchor_support_target} 次 / "
+            f"半透明形状={'开' if self.ui_anchor_translucent_enabled else '关'} / "
+            f"掩码补充={'开' if self.ui_anchor_refinement_enabled else '关'}"
+            f"（{self.ui_anchor_refinement_max_observations} 次 / "
+            f"无新增 {self.ui_anchor_refinement_no_growth_observations} 次 / "
+            f"{self.ui_anchor_refinement_expansion_radius_px} px） / "
+            f"{self.ui_anchor_minimum_motion_episodes} 个运动阶段 / "
+            f"模型内点 {self.ui_anchor_minimum_flow_model_inlier_ratio:.0%} / "
+            f"边侧 {self.ui_anchor_minimum_flow_perimeter_sides}/4 / "
+            f"证据 TTL {self.ui_anchor_maximum_evidence_gap_ms / 1000:g}s"
         )
 
 
@@ -293,7 +584,7 @@ class AdvancedSettingsDialog(QDialog):
             raise TypeError("settings must be AdvancedTraceSettings")
         self._accepted_settings = settings
         self.setWindowTitle("WorldTrace · 详细参数")
-        self.resize(680, 610)
+        self.resize(820, 860)
         root = QVBoxLayout(self)
         note = QLabel(
             "这些设置只影响下一次启动，不写入磁盘。主界面的常用参数仍优先作为快速入口。"
@@ -306,6 +597,7 @@ class AdvancedSettingsDialog(QDialog):
         tabs.addTab(self._build_visual_tab(), "视觉去重")
         tabs.addTab(self._build_ocr_tab(), "OCR")
         tabs.addTab(self._build_icon_tab(), "图标记录")
+        tabs.addTab(self._build_ui_anchor_tab(), "UI 锚点发现")
         root.addWidget(tabs, 1)
 
         self.button_box = QDialogButtonBox(
@@ -396,7 +688,13 @@ class AdvancedSettingsDialog(QDialog):
 
     def _build_icon_tab(self) -> QWidget:
         tab = QWidget()
-        root = QVBoxLayout(tab)
+        tab_layout = QVBoxLayout(tab)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
 
         strategy_group = QGroupBox("记录策略")
         strategy_columns = QHBoxLayout(strategy_group)
@@ -408,12 +706,8 @@ class AdvancedSettingsDialog(QDialog):
         self.icon_limit_mode_combo.addItem("指定数量", "limited")
         self.icon_limit_mode_combo.addItem("不限（直到停止）", "unlimited")
         self.icon_max_unique_candidates_spin = self._integer(1, 1_000)
-        self.icon_near_visual_dedup_check = QCheckBox(
-            "跳过附近且视觉近似的已记录候选"
-        )
-        self.icon_same_slot_dedup_check = QCheckBox(
-            "跳过同一屏幕点位的已记录候选"
-        )
+        self.icon_near_visual_dedup_check = QCheckBox("跳过附近且视觉近似的已记录候选")
+        self.icon_same_slot_dedup_check = QCheckBox("跳过同一屏幕点位的已记录候选")
         self.icon_visual_search_radius_spin = self._decimal(
             0.1,
             200.0,
@@ -452,6 +746,113 @@ class AdvancedSettingsDialog(QDialog):
         strategy_columns.addWidget(strategy_left_widget, 1)
         strategy_columns.addWidget(strategy_right_widget, 1)
         root.addWidget(strategy_group)
+
+        trigger_group = QGroupBox("采样帧差触发（固定 320×180 灰度）")
+        trigger_columns = QHBoxLayout(trigger_group)
+        trigger_left_widget = QWidget()
+        trigger_right_widget = QWidget()
+        trigger_left = QFormLayout(trigger_left_widget)
+        trigger_right = QFormLayout(trigger_right_widget)
+        self.icon_change_gate_check = QCheckBox("仅在大变化后的有界窗口运行重 CV")
+        self.icon_change_pixel_delta_spin = self._integer(0, 255)
+        self.icon_change_normal_ratio_spin = self._percentage()
+        self.icon_change_normal_mean_spin = self._decimal(0.0, 255.0, 2)
+        self.icon_change_normal_samples_spin = self._integer(1, 100)
+        self.icon_change_active_cells_spin = self._integer(1, 12)
+        self.icon_change_strong_ratio_spin = self._percentage()
+        self.icon_change_strong_mean_spin = self._decimal(0.0, 255.0, 2)
+        self.icon_change_quiet_ratio_spin = self._percentage()
+        self.icon_change_quiet_mean_spin = self._decimal(0.0, 255.0, 2)
+        self.icon_change_quiet_samples_spin = self._integer(1, 100)
+        self.icon_change_active_min_spin = self._integer(100, 60_000, " ms")
+        self.icon_change_active_max_spin = self._integer(100, 60_000, " ms")
+        self.icon_change_cooldown_spin = self._integer(100, 60_000, " ms")
+        self.icon_change_hit_cooldown_spin = self._integer(
+            100,
+            60_000,
+            " ms",
+        )
+        self.icon_change_max_gap_spin = self._integer(100, 60_000, " ms")
+        self.icon_change_gate_check.setToolTip(
+            "关闭后恢复为每个 HUD 采样都运行光流；开启后，静止画面只做"
+            "两张 320×180 灰度小图的相邻差与稳定锚点差。"
+        )
+        trigger_left.addRow("启用变化门控", self.icon_change_gate_check)
+        trigger_left.addRow("忽略像素差", self.icon_change_pixel_delta_spin)
+        trigger_left.addRow("普通变化率", self.icon_change_normal_ratio_spin)
+        trigger_left.addRow("普通变化均值差", self.icon_change_normal_mean_spin)
+        trigger_left.addRow("普通变化连续次数", self.icon_change_normal_samples_spin)
+        trigger_left.addRow("普通变化最少网格", self.icon_change_active_cells_spin)
+        trigger_left.addRow("强变化率", self.icon_change_strong_ratio_spin)
+        trigger_left.addRow("强变化均值差", self.icon_change_strong_mean_spin)
+        trigger_right.addRow("安静变化率", self.icon_change_quiet_ratio_spin)
+        trigger_right.addRow("安静均值差", self.icon_change_quiet_mean_spin)
+        trigger_right.addRow("安静连续次数", self.icon_change_quiet_samples_spin)
+        trigger_right.addRow("重 CV 最短窗口", self.icon_change_active_min_spin)
+        trigger_right.addRow("重 CV 最长窗口", self.icon_change_active_max_spin)
+        trigger_right.addRow("未命中冷却", self.icon_change_cooldown_spin)
+        trigger_right.addRow("候选命中冷却", self.icon_change_hit_cooldown_spin)
+        trigger_right.addRow("门控最大采样间隔", self.icon_change_max_gap_spin)
+        trigger_columns.addWidget(trigger_left_widget, 1)
+        trigger_columns.addWidget(trigger_right_widget, 1)
+        root.addWidget(trigger_group)
+
+        template_group = QGroupBox("SAM 模板登记与稳定帧核验")
+        template_columns = QHBoxLayout(template_group)
+        template_left_widget = QWidget()
+        template_right_widget = QWidget()
+        template_left = QFormLayout(template_left_widget)
+        template_right = QFormLayout(template_right_widget)
+        self.icon_sam_enabled_check = QCheckBox("候选保存后异步生成掩码预览")
+        self.icon_sam_device_combo = QComboBox()
+        self.icon_sam_device_combo.addItem("第二块 GPU（cuda:1）", "cuda:1")
+        self.icon_sam_device_combo.addItem("第一块 GPU（cuda:0）", "cuda:0")
+        self.icon_sam_device_combo.addItem("CPU", "cpu")
+        self.icon_sam_timeout_spin = self._decimal(1.0, 300.0, 1, " s")
+        self.icon_template_matching_check = QCheckBox("变化后重新稳定时做位置+掩码核验")
+        self.icon_template_max_active_spin = self._integer(1, 32)
+        self.icon_match_search_radius_spin = self._percentage()
+        self.icon_match_search_step_spin = self._integer(1, 64, " px")
+        self.icon_match_absent_score_spin = self._percentage()
+        self.icon_match_present_score_spin = self._percentage()
+        self.icon_sam_enabled_check.setToolTip(
+            "SAM 只处理已确认并保存的候选裁剪，不处理普通采样帧；"
+            "模板必须在主界面人工接受后才参与核验。"
+        )
+        self.icon_template_matching_check.setToolTip(
+            "每次大变化只在画面重新安静后核验一次；输出 "
+            "PRESENT / ABSENT / UNKNOWN，不直接断言游戏界面状态。"
+        )
+        template_left.addRow("启用 SAM 预览", self.icon_sam_enabled_check)
+        template_left.addRow("SAM 设备", self.icon_sam_device_combo)
+        template_left.addRow("SAM 单次响应上限", self.icon_sam_timeout_spin)
+        template_right.addRow(
+            "启用模板核验",
+            self.icon_template_matching_check,
+        )
+        template_right.addRow(
+            "本次最多激活模板",
+            self.icon_template_max_active_spin,
+        )
+        template_right.addRow(
+            "归一化搜索半径",
+            self.icon_match_search_radius_spin,
+        )
+        template_right.addRow(
+            "搜索步长",
+            self.icon_match_search_step_spin,
+        )
+        template_right.addRow(
+            "ABSENT 分数上限",
+            self.icon_match_absent_score_spin,
+        )
+        template_right.addRow(
+            "PRESENT 分数下限",
+            self.icon_match_present_score_spin,
+        )
+        template_columns.addWidget(template_left_widget, 1)
+        template_columns.addWidget(template_right_widget, 1)
+        root.addWidget(template_group)
 
         columns = QHBoxLayout()
         left_widget = QWidget()
@@ -532,6 +933,11 @@ class AdvancedSettingsDialog(QDialog):
         self.icon_same_slot_dedup_check.toggled.connect(
             self._update_icon_strategy_controls
         )
+        self.icon_change_gate_check.toggled.connect(self._update_icon_pipeline_controls)
+        self.icon_sam_enabled_check.toggled.connect(self._update_icon_pipeline_controls)
+        self.icon_template_matching_check.toggled.connect(
+            self._update_icon_pipeline_controls
+        )
         return tab
 
     def _update_icon_strategy_controls(self, *_args: object) -> None:
@@ -551,6 +957,260 @@ class AdvancedSettingsDialog(QDialog):
             self.icon_same_slot_iou_spin,
         ):
             widget.setEnabled(same_slot_enabled)
+
+    def _build_ui_anchor_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+
+        note = QLabel(
+            "本页只配置“屏幕固定 UI 锚点发现”。它与图标/SAM 模块独立；"
+            "只有差异门禁、一致光流模型及画布边侧覆盖共同证明"
+            "全局背景运动时才累计，"
+            "强变化不能绕过该门禁；达到目标后仍只生成 "
+            "PROVISIONAL 候选。分析画布固定为 320×180。"
+        )
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        columns = QHBoxLayout()
+        left_widget = QWidget()
+        right_widget = QWidget()
+        left = QFormLayout(left_widget)
+        right = QFormLayout(right_widget)
+
+        self.ui_anchor_support_target_spin = self._integer(2, 10_000)
+        self.ui_anchor_sample_interval_spin = self._integer(50, 5_000, " ms")
+        self.ui_anchor_max_gap_spin = self._integer(50, 30_000, " ms")
+        self.ui_anchor_evidence_gap_spin = self._integer(
+            50,
+            3_600_000,
+            " ms",
+        )
+        self.ui_anchor_stable_delta_spin = self._integer(0, 255)
+        self.ui_anchor_changed_delta_spin = self._integer(0, 255)
+        self.ui_anchor_minimum_changed_ratio_spin = self._percentage()
+        self.ui_anchor_minimum_mean_spin = self._decimal(0.0, 255.0, 2)
+        self.ui_anchor_strong_changed_ratio_spin = self._percentage()
+        self.ui_anchor_minimum_motion_cells_spin = self._integer(1, 12)
+        self.ui_anchor_minimum_flow_tracks_spin = self._integer(1, 500)
+        self.ui_anchor_flow_motion_threshold_spin = self._decimal(
+            0.1,
+            20.0,
+            2,
+            " px",
+        )
+        self.ui_anchor_minimum_flow_ratio_spin = self._percentage()
+        self.ui_anchor_minimum_flow_model_inlier_ratio_spin = self._percentage()
+        self.ui_anchor_minimum_flow_cells_spin = self._integer(1, 12)
+        self.ui_anchor_minimum_flow_perimeter_sides_spin = self._integer(1, 4)
+
+        left.addRow("分析画布", QLabel("320 × 180（固定）"))
+        left.addRow("晋升所需有效支持", self.ui_anchor_support_target_spin)
+        left.addRow("采样间隔", self.ui_anchor_sample_interval_spin)
+        left.addRow("最大采样间隔", self.ui_anchor_max_gap_spin)
+        left.addRow("累计证据最长断档", self.ui_anchor_evidence_gap_spin)
+        left.addRow("稳定像素差上限", self.ui_anchor_stable_delta_spin)
+        left.addRow("变化像素差下限", self.ui_anchor_changed_delta_spin)
+        left.addRow("全局变化率下限", self.ui_anchor_minimum_changed_ratio_spin)
+        left.addRow("全局均值差下限", self.ui_anchor_minimum_mean_spin)
+        left.addRow("强变化率", self.ui_anchor_strong_changed_ratio_spin)
+        left.addRow("最少运动网格", self.ui_anchor_minimum_motion_cells_spin)
+        left.addRow("最少有效光流", self.ui_anchor_minimum_flow_tracks_spin)
+        left.addRow("光流移动阈值", self.ui_anchor_flow_motion_threshold_spin)
+        left.addRow("移动光流比例", self.ui_anchor_minimum_flow_ratio_spin)
+        left.addRow(
+            "一致运动模型内点比例",
+            self.ui_anchor_minimum_flow_model_inlier_ratio_spin,
+        )
+        left.addRow("最少光流网格", self.ui_anchor_minimum_flow_cells_spin)
+        left.addRow(
+            "最少触及内容边侧",
+            self.ui_anchor_minimum_flow_perimeter_sides_spin,
+        )
+
+        self.ui_anchor_quiet_samples_spin = self._integer(1, 100)
+        self.ui_anchor_edge_threshold_spin = self._integer(1, 255)
+        self.ui_anchor_context_radius_spin = self._integer(1, 64, " px")
+        self.ui_anchor_vote_dilation_spin = self._integer(0, 4, " px")
+        self.ui_anchor_minimum_core_pixels_spin = self._integer(1, 10_000)
+        self.ui_anchor_minimum_side_spin = self._integer(1, 180, " px")
+        self.ui_anchor_maximum_area_spin = self._percentage()
+        self.ui_anchor_minimum_support_ratio_spin = self._percentage()
+        self.ui_anchor_minimum_episodes_spin = self._integer(1, 100)
+        self.ui_anchor_minimum_direction_bins_spin = self._integer(1, 8)
+        self.ui_anchor_maximum_candidates_spin = self._integer(1, 128)
+
+        right.addRow("关闭运动阶段的安静样本", self.ui_anchor_quiet_samples_spin)
+        right.addRow("边缘强度阈值", self.ui_anchor_edge_threshold_spin)
+        right.addRow("运动邻域半径", self.ui_anchor_context_radius_spin)
+        right.addRow("稳定投票膨胀", self.ui_anchor_vote_dilation_spin)
+        right.addRow("稳定核心最少像素", self.ui_anchor_minimum_core_pixels_spin)
+        right.addRow("候选最短边", self.ui_anchor_minimum_side_spin)
+        right.addRow("候选最大画布面积", self.ui_anchor_maximum_area_spin)
+        right.addRow("最低支持率", self.ui_anchor_minimum_support_ratio_spin)
+        right.addRow("最少独立运动阶段", self.ui_anchor_minimum_episodes_spin)
+        right.addRow("最少运动方向数", self.ui_anchor_minimum_direction_bins_spin)
+        right.addRow("本次运行最多候选", self.ui_anchor_maximum_candidates_spin)
+
+        columns.addWidget(left_widget, 1)
+        columns.addWidget(right_widget, 1)
+        root.addLayout(columns)
+        translucent_group = QGroupBox("半透明固定形状通道（实验）")
+        translucent_form = QFormLayout(translucent_group)
+        self.ui_anchor_translucent_enabled_check = QCheckBox(
+            "启用独立形状支持图"
+        )
+        self.ui_anchor_translucent_enabled_check.setToolTip(
+            "只在世界运动门禁通过时累计；紫色仅表示半透明形状提示，"
+            "不表示已恢复真实透明度。"
+        )
+        self.ui_anchor_translucent_edge_threshold_spin = self._integer(1, 255)
+        self.ui_anchor_translucent_orientation_similarity_spin = (
+            self._percentage()
+        )
+        self.ui_anchor_translucent_max_local_change_ratio_spin = (
+            self._percentage()
+        )
+        self.ui_anchor_translucent_minimum_support_ratio_spin = (
+            self._percentage()
+        )
+        translucent_form.addRow(
+            self.ui_anchor_translucent_enabled_check
+        )
+        translucent_form.addRow(
+            "低对比边缘阈值",
+            self.ui_anchor_translucent_edge_threshold_spin,
+        )
+        translucent_form.addRow(
+            "长期梯度方向一致度",
+            self.ui_anchor_translucent_orientation_similarity_spin,
+        )
+        translucent_form.addRow(
+            "点位/外围最大变化比例",
+            self.ui_anchor_translucent_max_local_change_ratio_spin,
+        )
+        translucent_form.addRow(
+            "最低形状支持率",
+            self.ui_anchor_translucent_minimum_support_ratio_spin,
+        )
+        root.addWidget(translucent_group)
+
+        refinement_group = QGroupBox("晋升后掩码补充（实验）")
+        refinement_form = QFormLayout(refinement_group)
+        self.ui_anchor_refinement_enabled_check = QCheckBox(
+            "启用种子掩码增量补充"
+        )
+        self.ui_anchor_refinement_enabled_check.setToolTip(
+            "首次达到晋升门槛后先保留不可缩小的种子；"
+            "只用随后通过世界运动门禁的观察补充邻近像素，"
+            "补充结束后才保存一次最终候选。"
+        )
+        self.ui_anchor_refinement_max_observations_spin = self._integer(
+            1,
+            500,
+        )
+        self.ui_anchor_refinement_max_observations_spin.setToolTip(
+            "建立种子后的有效世界运动观察上限；建立种子的当前帧不计入。"
+        )
+        self.ui_anchor_refinement_no_growth_observations_spin = self._integer(
+            1,
+            500,
+        )
+        self.ui_anchor_refinement_no_growth_observations_spin.setToolTip(
+            "连续多少次有效观察没有正式新增像素后，提前结束补充。"
+        )
+        self.ui_anchor_refinement_expansion_radius_spin = self._integer(
+            1,
+            16,
+            " px",
+        )
+        self.ui_anchor_refinement_expansion_radius_spin.setToolTip(
+            "相对最初种子掩码允许向外补充的固定半径；"
+            "不会围绕新增像素继续递归扩张。"
+        )
+        refinement_form.addRow(self.ui_anchor_refinement_enabled_check)
+        refinement_form.addRow(
+            "最多补充观察",
+            self.ui_anchor_refinement_max_observations_spin,
+        )
+        refinement_form.addRow(
+            "连续无新增结束",
+            self.ui_anchor_refinement_no_growth_observations_spin,
+        )
+        refinement_form.addRow(
+            "最大向外扩展",
+            self.ui_anchor_refinement_expansion_radius_spin,
+        )
+        root.addWidget(refinement_group)
+        root.addStretch(1)
+        self.ui_anchor_translucent_enabled_check.toggled.connect(
+            self._update_ui_anchor_translucent_controls
+        )
+        self.ui_anchor_refinement_enabled_check.toggled.connect(
+            self._update_ui_anchor_refinement_controls
+        )
+        return tab
+
+    def _update_ui_anchor_translucent_controls(self, *_args: object) -> None:
+        enabled = self.ui_anchor_translucent_enabled_check.isChecked()
+        for widget in (
+            self.ui_anchor_translucent_edge_threshold_spin,
+            self.ui_anchor_translucent_orientation_similarity_spin,
+            self.ui_anchor_translucent_max_local_change_ratio_spin,
+            self.ui_anchor_translucent_minimum_support_ratio_spin,
+        ):
+            widget.setEnabled(enabled)
+
+    def _update_ui_anchor_refinement_controls(self, *_args: object) -> None:
+        enabled = self.ui_anchor_refinement_enabled_check.isChecked()
+        for widget in (
+            self.ui_anchor_refinement_max_observations_spin,
+            self.ui_anchor_refinement_no_growth_observations_spin,
+            self.ui_anchor_refinement_expansion_radius_spin,
+        ):
+            widget.setEnabled(enabled)
+
+    def _update_icon_pipeline_controls(self, *_args: object) -> None:
+        gate_enabled = self.icon_change_gate_check.isChecked()
+        self.icon_template_matching_check.setEnabled(gate_enabled)
+        if not gate_enabled:
+            self.icon_template_matching_check.setChecked(False)
+        for widget in (
+            self.icon_change_pixel_delta_spin,
+            self.icon_change_normal_ratio_spin,
+            self.icon_change_normal_mean_spin,
+            self.icon_change_normal_samples_spin,
+            self.icon_change_active_cells_spin,
+            self.icon_change_strong_ratio_spin,
+            self.icon_change_strong_mean_spin,
+            self.icon_change_quiet_ratio_spin,
+            self.icon_change_quiet_mean_spin,
+            self.icon_change_quiet_samples_spin,
+            self.icon_change_active_min_spin,
+            self.icon_change_active_max_spin,
+            self.icon_change_cooldown_spin,
+            self.icon_change_hit_cooldown_spin,
+            self.icon_change_max_gap_spin,
+        ):
+            widget.setEnabled(gate_enabled)
+        sam_enabled = self.icon_sam_enabled_check.isChecked()
+        self.icon_sam_device_combo.setEnabled(sam_enabled)
+        self.icon_sam_timeout_spin.setEnabled(sam_enabled)
+        matcher_enabled = self.icon_template_matching_check.isChecked()
+        for widget in (
+            self.icon_template_max_active_spin,
+            self.icon_match_search_radius_spin,
+            self.icon_match_search_step_spin,
+            self.icon_match_absent_score_spin,
+            self.icon_match_present_score_spin,
+        ):
+            widget.setEnabled(matcher_enabled)
 
     @staticmethod
     def _integer(
@@ -599,26 +1259,18 @@ class AdvancedSettingsDialog(QDialog):
         self.duplicate_mae_spin.setValue(settings.duplicate_normalized_mae * 100.0)
         self.ocr_gray_phash_spin.setValue(settings.ocr_gray_phash_distance)
         self.ocr_gray_ratio_spin.setValue(settings.ocr_gray_changed_ratio * 100.0)
-        self.ocr_gray_mae_spin.setValue(
-            settings.ocr_gray_normalized_mae * 100.0
-        )
+        self.ocr_gray_mae_spin.setValue(settings.ocr_gray_normalized_mae * 100.0)
         self.ocr_neighbors_spin.setValue(settings.ocr_max_neighbors)
         self.max_aliases_spin.setValue(settings.max_aliases_per_canonical)
         self.max_catalog_spin.setValue(settings.max_catalog_entries)
         self.ocr_confidence_spin.setValue(settings.ocr_minimum_confidence * 100.0)
-        self.ocr_bbox_edge_spin.setValue(
-            settings.ocr_bbox_edge_tolerance * 100.0
-        )
+        self.ocr_bbox_edge_spin.setValue(settings.ocr_bbox_edge_tolerance * 100.0)
         self.ocr_bbox_iou_spin.setValue(settings.ocr_bbox_iou_threshold * 100.0)
         self.ocr_response_timeout_spin.setValue(settings.ocr_response_timeout_s)
         self.ocr_candidate_timeout_spin.setValue(settings.ocr_candidate_timeout_s)
         self.ocr_max_input_edge_spin.setValue(settings.ocr_max_input_edge)
-        self.ocr_reference_entries_spin.setValue(
-            settings.ocr_max_reference_entries
-        )
-        self.ocr_reference_memory_spin.setValue(
-            settings.ocr_max_reference_mebibytes
-        )
+        self.ocr_reference_entries_spin.setValue(settings.ocr_max_reference_entries)
+        self.ocr_reference_memory_spin.setValue(settings.ocr_max_reference_mebibytes)
         limit_mode = (
             "unlimited" if settings.icon_max_unique_candidates is None else "limited"
         )
@@ -640,9 +1292,7 @@ class AdvancedSettingsDialog(QDialog):
             settings.icon_visual_search_radius_px
         )
         self.icon_visual_phash_spin.setValue(settings.icon_visual_phash_distance)
-        self.icon_visual_mae_spin.setValue(
-            settings.icon_visual_normalized_mae * 100.0
-        )
+        self.icon_visual_mae_spin.setValue(settings.icon_visual_normalized_mae * 100.0)
         self.icon_same_slot_radius_spin.setValue(settings.icon_same_slot_radius_px)
         self.icon_same_slot_iou_spin.setValue(settings.icon_same_slot_iou * 100.0)
         self.icon_canvas_width_spin.setValue(settings.icon_canvas_width)
@@ -655,9 +1305,7 @@ class AdvancedSettingsDialog(QDialog):
             settings.icon_motion_displacement_px
         )
         self.icon_motion_ratio_spin.setValue(settings.icon_motion_track_ratio * 100.0)
-        self.icon_motion_grid_columns_spin.setValue(
-            settings.icon_motion_grid_columns
-        )
+        self.icon_motion_grid_columns_spin.setValue(settings.icon_motion_grid_columns)
         self.icon_motion_grid_rows_spin.setValue(settings.icon_motion_grid_rows)
         self.icon_minimum_motion_cells_spin.setValue(
             settings.icon_minimum_motion_grid_cells
@@ -670,9 +1318,7 @@ class AdvancedSettingsDialog(QDialog):
         self.icon_fixed_path_spin.setValue(settings.icon_fixed_max_path_px)
         self.icon_cluster_radius_spin.setValue(settings.icon_cluster_radius_px)
         self.icon_minimum_cluster_spin.setValue(settings.icon_minimum_cluster_points)
-        self.icon_minimum_side_spin.setValue(
-            settings.icon_minimum_candidate_side_px
-        )
+        self.icon_minimum_side_spin.setValue(settings.icon_minimum_candidate_side_px)
         self.icon_maximum_area_spin.setValue(
             settings.icon_maximum_candidate_area_ratio * 100.0
         )
@@ -684,17 +1330,171 @@ class AdvancedSettingsDialog(QDialog):
         self.icon_context_motion_ratio_spin.setValue(
             settings.icon_context_motion_ratio * 100.0
         )
-        self.icon_confirmation_iou_spin.setValue(
-            settings.icon_confirmation_iou * 100.0
-        )
+        self.icon_confirmation_iou_spin.setValue(settings.icon_confirmation_iou * 100.0)
         self.icon_confirmation_distance_spin.setValue(
             settings.icon_confirmation_center_distance_px
         )
         self.icon_crop_padding_spin.setValue(settings.icon_crop_padding_px)
+        self.icon_change_gate_check.setChecked(settings.icon_change_gate_enabled)
+        self.icon_change_pixel_delta_spin.setValue(
+            settings.icon_change_pixel_delta_threshold
+        )
+        self.icon_change_normal_ratio_spin.setValue(
+            settings.icon_change_normal_ratio * 100.0
+        )
+        self.icon_change_normal_mean_spin.setValue(
+            settings.icon_change_normal_mean_difference
+        )
+        self.icon_change_normal_samples_spin.setValue(
+            settings.icon_change_normal_samples
+        )
+        self.icon_change_active_cells_spin.setValue(
+            settings.icon_change_minimum_active_cells
+        )
+        self.icon_change_strong_ratio_spin.setValue(
+            settings.icon_change_strong_ratio * 100.0
+        )
+        self.icon_change_strong_mean_spin.setValue(
+            settings.icon_change_strong_mean_difference
+        )
+        self.icon_change_quiet_ratio_spin.setValue(
+            settings.icon_change_quiet_ratio * 100.0
+        )
+        self.icon_change_quiet_mean_spin.setValue(
+            settings.icon_change_quiet_mean_difference
+        )
+        self.icon_change_quiet_samples_spin.setValue(settings.icon_change_quiet_samples)
+        self.icon_change_active_min_spin.setValue(settings.icon_change_active_min_ms)
+        self.icon_change_active_max_spin.setValue(settings.icon_change_active_max_ms)
+        self.icon_change_cooldown_spin.setValue(settings.icon_change_cooldown_ms)
+        self.icon_change_hit_cooldown_spin.setValue(
+            settings.icon_change_hit_cooldown_ms
+        )
+        self.icon_change_max_gap_spin.setValue(settings.icon_change_max_sample_gap_ms)
+        self.icon_sam_enabled_check.setChecked(settings.icon_sam_enabled)
+        self.icon_sam_device_combo.setCurrentIndex(
+            self.icon_sam_device_combo.findData(settings.icon_sam_device)
+        )
+        self.icon_sam_timeout_spin.setValue(settings.icon_sam_timeout_s)
+        self.icon_template_matching_check.setChecked(
+            settings.icon_template_matching_enabled
+        )
+        self.icon_template_max_active_spin.setValue(settings.icon_template_max_active)
+        self.icon_match_search_radius_spin.setValue(
+            settings.icon_match_search_radius_normalized * 100.0
+        )
+        self.icon_match_search_step_spin.setValue(settings.icon_match_search_step_px)
+        self.icon_match_absent_score_spin.setValue(
+            settings.icon_match_absent_score_threshold * 100.0
+        )
+        self.icon_match_present_score_spin.setValue(
+            settings.icon_match_present_score_threshold * 100.0
+        )
+        self.ui_anchor_support_target_spin.setValue(settings.ui_anchor_support_target)
+        self.ui_anchor_sample_interval_spin.setValue(
+            settings.ui_anchor_sample_interval_ms
+        )
+        self.ui_anchor_max_gap_spin.setValue(settings.ui_anchor_max_sample_gap_ms)
+        self.ui_anchor_evidence_gap_spin.setValue(
+            settings.ui_anchor_maximum_evidence_gap_ms
+        )
+        self.ui_anchor_stable_delta_spin.setValue(settings.ui_anchor_stable_pixel_delta)
+        self.ui_anchor_changed_delta_spin.setValue(
+            settings.ui_anchor_changed_pixel_delta
+        )
+        self.ui_anchor_minimum_changed_ratio_spin.setValue(
+            settings.ui_anchor_minimum_changed_ratio * 100.0
+        )
+        self.ui_anchor_minimum_mean_spin.setValue(
+            settings.ui_anchor_minimum_mean_difference
+        )
+        self.ui_anchor_strong_changed_ratio_spin.setValue(
+            settings.ui_anchor_strong_changed_ratio * 100.0
+        )
+        self.ui_anchor_minimum_motion_cells_spin.setValue(
+            settings.ui_anchor_minimum_motion_grid_cells
+        )
+        self.ui_anchor_minimum_flow_tracks_spin.setValue(
+            settings.ui_anchor_minimum_flow_tracks
+        )
+        self.ui_anchor_flow_motion_threshold_spin.setValue(
+            settings.ui_anchor_flow_motion_threshold_px
+        )
+        self.ui_anchor_minimum_flow_ratio_spin.setValue(
+            settings.ui_anchor_minimum_flow_moving_ratio * 100.0
+        )
+        self.ui_anchor_minimum_flow_model_inlier_ratio_spin.setValue(
+            settings.ui_anchor_minimum_flow_model_inlier_ratio * 100.0
+        )
+        self.ui_anchor_minimum_flow_cells_spin.setValue(
+            settings.ui_anchor_minimum_flow_grid_cells
+        )
+        self.ui_anchor_minimum_flow_perimeter_sides_spin.setValue(
+            settings.ui_anchor_minimum_flow_perimeter_sides
+        )
+        self.ui_anchor_quiet_samples_spin.setValue(
+            settings.ui_anchor_quiet_samples_to_close_episode
+        )
+        self.ui_anchor_edge_threshold_spin.setValue(settings.ui_anchor_edge_threshold)
+        self.ui_anchor_context_radius_spin.setValue(
+            settings.ui_anchor_motion_context_radius_px
+        )
+        self.ui_anchor_vote_dilation_spin.setValue(settings.ui_anchor_vote_dilation_px)
+        self.ui_anchor_minimum_core_pixels_spin.setValue(
+            settings.ui_anchor_minimum_core_pixels
+        )
+        self.ui_anchor_minimum_side_spin.setValue(
+            settings.ui_anchor_minimum_candidate_side_px
+        )
+        self.ui_anchor_maximum_area_spin.setValue(
+            settings.ui_anchor_maximum_candidate_area_ratio * 100.0
+        )
+        self.ui_anchor_minimum_support_ratio_spin.setValue(
+            settings.ui_anchor_minimum_support_ratio * 100.0
+        )
+        self.ui_anchor_minimum_episodes_spin.setValue(
+            settings.ui_anchor_minimum_motion_episodes
+        )
+        self.ui_anchor_minimum_direction_bins_spin.setValue(
+            settings.ui_anchor_minimum_motion_direction_bins
+        )
+        self.ui_anchor_maximum_candidates_spin.setValue(
+            settings.ui_anchor_maximum_candidates
+        )
+        self.ui_anchor_translucent_enabled_check.setChecked(
+            settings.ui_anchor_translucent_enabled
+        )
+        self.ui_anchor_translucent_edge_threshold_spin.setValue(
+            settings.ui_anchor_translucent_edge_threshold
+        )
+        self.ui_anchor_translucent_orientation_similarity_spin.setValue(
+            settings.ui_anchor_translucent_orientation_similarity * 100.0
+        )
+        self.ui_anchor_translucent_max_local_change_ratio_spin.setValue(
+            settings.ui_anchor_translucent_max_local_change_ratio * 100.0
+        )
+        self.ui_anchor_translucent_minimum_support_ratio_spin.setValue(
+            settings.ui_anchor_translucent_minimum_support_ratio * 100.0
+        )
+        self.ui_anchor_refinement_enabled_check.setChecked(
+            settings.ui_anchor_refinement_enabled
+        )
+        self.ui_anchor_refinement_max_observations_spin.setValue(
+            settings.ui_anchor_refinement_max_observations
+        )
+        self.ui_anchor_refinement_no_growth_observations_spin.setValue(
+            settings.ui_anchor_refinement_no_growth_observations
+        )
+        self.ui_anchor_refinement_expansion_radius_spin.setValue(
+            settings.ui_anchor_refinement_expansion_radius_px
+        )
+        self._update_ui_anchor_translucent_controls()
+        self._update_ui_anchor_refinement_controls()
         self.quiet_confirm_spin.setEnabled(
             not settings.quiet_confirm_follows_stable_duration
         )
         self._update_icon_strategy_controls()
+        self._update_icon_pipeline_controls()
 
     def current_settings(self) -> AdvancedTraceSettings:
         return AdvancedTraceSettings(
@@ -707,9 +1507,7 @@ class AdvancedSettingsDialog(QDialog):
             depart_changed_ratio=self.depart_ratio_spin.value() / 100.0,
             depart_mean_difference=self.depart_mean_spin.value(),
             depart_comparisons=self.depart_comparisons_spin.value(),
-            quiet_confirm_follows_stable_duration=(
-                self.quiet_follow_check.isChecked()
-            ),
+            quiet_confirm_follows_stable_duration=(self.quiet_follow_check.isChecked()),
             quiet_confirm_ms=self.quiet_confirm_spin.value(),
             duplicate_phash_distance=self.duplicate_phash_spin.value(),
             duplicate_normalized_mae=self.duplicate_mae_spin.value() / 100.0,
@@ -735,9 +1533,7 @@ class AdvancedSettingsDialog(QDialog):
             icon_near_visual_dedup_enabled=(
                 self.icon_near_visual_dedup_check.isChecked()
             ),
-            icon_same_slot_dedup_enabled=(
-                self.icon_same_slot_dedup_check.isChecked()
-            ),
+            icon_same_slot_dedup_enabled=(self.icon_same_slot_dedup_check.isChecked()),
             icon_visual_search_radius_px=self.icon_visual_search_radius_spin.value(),
             icon_visual_phash_distance=self.icon_visual_phash_spin.value(),
             icon_visual_normalized_mae=self.icon_visual_mae_spin.value() / 100.0,
@@ -749,9 +1545,7 @@ class AdvancedSettingsDialog(QDialog):
             icon_max_sample_gap_ms=self.icon_max_gap_spin.value(),
             icon_max_corners=self.icon_max_corners_spin.value(),
             icon_minimum_valid_tracks=self.icon_minimum_tracks_spin.value(),
-            icon_motion_displacement_px=(
-                self.icon_motion_displacement_spin.value()
-            ),
+            icon_motion_displacement_px=(self.icon_motion_displacement_spin.value()),
             icon_motion_track_ratio=self.icon_motion_ratio_spin.value() / 100.0,
             icon_motion_grid_columns=self.icon_motion_grid_columns_spin.value(),
             icon_motion_grid_rows=self.icon_motion_grid_rows_spin.value(),
@@ -759,9 +1553,7 @@ class AdvancedSettingsDialog(QDialog):
                 self.icon_minimum_motion_cells_spin.value()
             ),
             icon_window_samples=self.icon_window_samples_spin.value(),
-            icon_required_motion_transitions=(
-                self.icon_required_motion_spin.value()
-            ),
+            icon_required_motion_transitions=(self.icon_required_motion_spin.value()),
             icon_fixed_max_radius_px=self.icon_fixed_radius_spin.value(),
             icon_fixed_max_path_px=self.icon_fixed_path_spin.value(),
             icon_cluster_radius_px=self.icon_cluster_radius_spin.value(),
@@ -783,6 +1575,150 @@ class AdvancedSettingsDialog(QDialog):
                 self.icon_confirmation_distance_spin.value()
             ),
             icon_crop_padding_px=self.icon_crop_padding_spin.value(),
+            icon_change_gate_enabled=self.icon_change_gate_check.isChecked(),
+            icon_change_pixel_delta_threshold=(
+                self.icon_change_pixel_delta_spin.value()
+            ),
+            icon_change_normal_ratio=(
+                self.icon_change_normal_ratio_spin.value() / 100.0
+            ),
+            icon_change_normal_mean_difference=(
+                self.icon_change_normal_mean_spin.value()
+            ),
+            icon_change_normal_samples=(self.icon_change_normal_samples_spin.value()),
+            icon_change_minimum_active_cells=(
+                self.icon_change_active_cells_spin.value()
+            ),
+            icon_change_strong_ratio=(
+                self.icon_change_strong_ratio_spin.value() / 100.0
+            ),
+            icon_change_strong_mean_difference=(
+                self.icon_change_strong_mean_spin.value()
+            ),
+            icon_change_quiet_ratio=(self.icon_change_quiet_ratio_spin.value() / 100.0),
+            icon_change_quiet_mean_difference=(
+                self.icon_change_quiet_mean_spin.value()
+            ),
+            icon_change_quiet_samples=(self.icon_change_quiet_samples_spin.value()),
+            icon_change_active_min_ms=self.icon_change_active_min_spin.value(),
+            icon_change_active_max_ms=self.icon_change_active_max_spin.value(),
+            icon_change_cooldown_ms=self.icon_change_cooldown_spin.value(),
+            icon_change_hit_cooldown_ms=(self.icon_change_hit_cooldown_spin.value()),
+            icon_change_max_sample_gap_ms=(self.icon_change_max_gap_spin.value()),
+            icon_sam_enabled=self.icon_sam_enabled_check.isChecked(),
+            icon_sam_device=str(self.icon_sam_device_combo.currentData()),
+            icon_sam_timeout_s=self.icon_sam_timeout_spin.value(),
+            icon_template_matching_enabled=(
+                self.icon_template_matching_check.isChecked()
+            ),
+            icon_template_max_active=(self.icon_template_max_active_spin.value()),
+            icon_match_search_radius_normalized=(
+                self.icon_match_search_radius_spin.value() / 100.0
+            ),
+            icon_match_search_step_px=self.icon_match_search_step_spin.value(),
+            icon_match_absent_score_threshold=(
+                self.icon_match_absent_score_spin.value() / 100.0
+            ),
+            icon_match_present_score_threshold=(
+                self.icon_match_present_score_spin.value() / 100.0
+            ),
+            ui_anchor_support_target=self.ui_anchor_support_target_spin.value(),
+            ui_anchor_sample_interval_ms=(self.ui_anchor_sample_interval_spin.value()),
+            ui_anchor_max_sample_gap_ms=self.ui_anchor_max_gap_spin.value(),
+            ui_anchor_maximum_evidence_gap_ms=(
+                self.ui_anchor_evidence_gap_spin.value()
+            ),
+            ui_anchor_stable_pixel_delta=self.ui_anchor_stable_delta_spin.value(),
+            ui_anchor_changed_pixel_delta=self.ui_anchor_changed_delta_spin.value(),
+            ui_anchor_minimum_changed_ratio=(
+                self.ui_anchor_minimum_changed_ratio_spin.value() / 100.0
+            ),
+            ui_anchor_minimum_mean_difference=(
+                self.ui_anchor_minimum_mean_spin.value()
+            ),
+            ui_anchor_strong_changed_ratio=(
+                self.ui_anchor_strong_changed_ratio_spin.value() / 100.0
+            ),
+            ui_anchor_minimum_motion_grid_cells=(
+                self.ui_anchor_minimum_motion_cells_spin.value()
+            ),
+            ui_anchor_minimum_flow_tracks=(
+                self.ui_anchor_minimum_flow_tracks_spin.value()
+            ),
+            ui_anchor_flow_motion_threshold_px=(
+                self.ui_anchor_flow_motion_threshold_spin.value()
+            ),
+            ui_anchor_minimum_flow_moving_ratio=(
+                self.ui_anchor_minimum_flow_ratio_spin.value() / 100.0
+            ),
+            ui_anchor_minimum_flow_model_inlier_ratio=(
+                self.ui_anchor_minimum_flow_model_inlier_ratio_spin.value() / 100.0
+            ),
+            ui_anchor_minimum_flow_grid_cells=(
+                self.ui_anchor_minimum_flow_cells_spin.value()
+            ),
+            ui_anchor_minimum_flow_perimeter_sides=(
+                self.ui_anchor_minimum_flow_perimeter_sides_spin.value()
+            ),
+            ui_anchor_quiet_samples_to_close_episode=(
+                self.ui_anchor_quiet_samples_spin.value()
+            ),
+            ui_anchor_edge_threshold=self.ui_anchor_edge_threshold_spin.value(),
+            ui_anchor_motion_context_radius_px=(
+                self.ui_anchor_context_radius_spin.value()
+            ),
+            ui_anchor_vote_dilation_px=self.ui_anchor_vote_dilation_spin.value(),
+            ui_anchor_minimum_core_pixels=(
+                self.ui_anchor_minimum_core_pixels_spin.value()
+            ),
+            ui_anchor_minimum_candidate_side_px=(
+                self.ui_anchor_minimum_side_spin.value()
+            ),
+            ui_anchor_maximum_candidate_area_ratio=(
+                self.ui_anchor_maximum_area_spin.value() / 100.0
+            ),
+            ui_anchor_minimum_support_ratio=(
+                self.ui_anchor_minimum_support_ratio_spin.value() / 100.0
+            ),
+            ui_anchor_minimum_motion_episodes=(
+                self.ui_anchor_minimum_episodes_spin.value()
+            ),
+            ui_anchor_minimum_motion_direction_bins=(
+                self.ui_anchor_minimum_direction_bins_spin.value()
+            ),
+            ui_anchor_maximum_candidates=(
+                self.ui_anchor_maximum_candidates_spin.value()
+            ),
+            ui_anchor_translucent_enabled=(
+                self.ui_anchor_translucent_enabled_check.isChecked()
+            ),
+            ui_anchor_translucent_edge_threshold=(
+                self.ui_anchor_translucent_edge_threshold_spin.value()
+            ),
+            ui_anchor_translucent_orientation_similarity=(
+                self.ui_anchor_translucent_orientation_similarity_spin.value()
+                / 100.0
+            ),
+            ui_anchor_translucent_max_local_change_ratio=(
+                self.ui_anchor_translucent_max_local_change_ratio_spin.value()
+                / 100.0
+            ),
+            ui_anchor_translucent_minimum_support_ratio=(
+                self.ui_anchor_translucent_minimum_support_ratio_spin.value()
+                / 100.0
+            ),
+            ui_anchor_refinement_enabled=(
+                self.ui_anchor_refinement_enabled_check.isChecked()
+            ),
+            ui_anchor_refinement_max_observations=(
+                self.ui_anchor_refinement_max_observations_spin.value()
+            ),
+            ui_anchor_refinement_no_growth_observations=(
+                self.ui_anchor_refinement_no_growth_observations_spin.value()
+            ),
+            ui_anchor_refinement_expansion_radius_px=(
+                self.ui_anchor_refinement_expansion_radius_spin.value()
+            ),
         )
 
     def settings(self) -> AdvancedTraceSettings:
