@@ -159,6 +159,7 @@ class KeyframeSessionStats:
     ui_anchor_support_target: int = 50
     ui_anchor_progress_regions: int = 0
     ui_anchor_refining_regions: int = 0
+    ui_anchor_tracking_regions: int = 0
     ui_anchor_promoted_candidates: int = 0
     ui_anchor_persisted_candidates: int = 0
     ui_anchor_last_reason_code: str = "DISABLED"
@@ -462,6 +463,9 @@ class KeyframeDetectionSession:
                 ),
                 ui_anchor_refining_regions=int(
                     getattr(ui_anchor_stats, "refining_regions", 0)
+                ),
+                ui_anchor_tracking_regions=int(
+                    getattr(ui_anchor_stats, "tracking_regions", 0)
                 ),
                 ui_anchor_promoted_candidates=int(
                     getattr(ui_anchor_stats, "promoted_candidates", 0)

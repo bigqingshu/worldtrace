@@ -15,6 +15,7 @@ from experiments.minimal_trace_gui.ui_anchor_discovery import (
     UiAnchorMotionState,
     UiAnchorProgressBlockingReason,
     UiAnchorProgressStage,
+    UiAnchorTrackingRegion,
 )
 
 
@@ -102,6 +103,8 @@ def _refinement_policy(
     maximum_observations: int = 12,
     no_growth_observations: int = 5,
     expansion_radius_px: int = 4,
+    tracking_add_observations: int = 2,
+    tracking_remove_observations: int = 4,
 ) -> UiAnchorDiscoveryPolicy:
     """Use small deterministic gates for refinement state-machine tests."""
 
@@ -116,6 +119,8 @@ def _refinement_policy(
         refinement_max_observations=maximum_observations,
         refinement_no_growth_observations=no_growth_observations,
         refinement_expansion_radius_px=expansion_radius_px,
+        tracking_add_observations=tracking_add_observations,
+        tracking_remove_observations=tracking_remove_observations,
     )
 
 
@@ -329,6 +334,47 @@ def _candidate_core_canvas(candidate: UiAnchorCandidate) -> np.ndarray:
     x1, y1, x2, y2 = candidate.bbox_canvas
     canvas[y1:y2, x1:x2] = candidate.stable_core_mask
     return canvas
+
+
+def _canvas_mask(
+    *boxes: tuple[int, int, int, int],
+) -> np.ndarray:
+    mask = np.zeros((_HEIGHT, _WIDTH), dtype=np.bool_)
+    for x1, y1, x2, y2 in boxes:
+        mask[y1:y2, x1:x2] = True
+    return mask
+
+
+def _tracking_active_canvas(region: UiAnchorTrackingRegion) -> np.ndarray:
+    canvas = np.zeros((_HEIGHT, _WIDTH), dtype=np.bool_)
+    x1, y1, x2, y2 = region.bbox_canvas
+    canvas[y1:y2, x1:x2] = region.active_mask
+    return canvas
+
+
+def _direct_tracking_round(
+    accumulator: ScreenLockedRegionAccumulator,
+    *,
+    index: int,
+    positive: np.ndarray,
+    eligible: np.ndarray,
+    scope_id: str = "layout-a",
+) -> tuple[UiAnchorCandidate, ...]:
+    rgb = np.full(
+        (_HEIGHT, _WIDTH, 3),
+        index % 256,
+        dtype=np.uint8,
+    )
+    return accumulator._promote_candidates(
+        rgb,
+        np.ones((_HEIGHT, _WIDTH), dtype=np.bool_),
+        f"tracking-frame-{index:03d}",
+        scope_id,
+        (index + 1) * 100_000_000,
+        {"tracking_round": index},
+        tracking_positive=np.ascontiguousarray(positive, dtype=np.bool_),
+        tracking_eligible=np.ascontiguousarray(eligible, dtype=np.bool_),
+    )
 
 
 class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
@@ -773,6 +819,295 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
             {"refinement_round": 4},
         )
 
+    def test_completed_candidate_keeps_tracking_and_accepts_late_growth(
+        self,
+    ) -> None:
+        accumulator = ScreenLockedRegionAccumulator(
+            _refinement_policy(
+                maximum_observations=2,
+                no_growth_observations=1,
+                tracking_add_observations=2,
+            )
+        )
+        accumulator.reset("layout-a")
+        seed_box = (30, 30, 38, 38)
+        growth_box = (38, 32, 42, 36)
+        _set_opaque_candidate_evidence(
+            accumulator,
+            seed_box,
+            support=4,
+        )
+        self.assertEqual(_direct_promotion_round(accumulator, index=0), ())
+        completed = _direct_promotion_round(accumulator, index=1)
+
+        self.assertEqual(
+            [candidate.candidate_id for candidate in completed],
+            ["ui-anchor-000001"],
+        )
+        self.assertEqual(accumulator._refinement_regions(), ())
+        initial = accumulator._tracking_regions()
+        self.assertEqual(len(initial), 1)
+        self.assertEqual(initial[0].candidate_id, "ui-anchor-000001")
+        self.assertEqual(initial[0].revision, 1)
+
+        stable = _canvas_mask(seed_box)
+        eligible = _canvas_mask(seed_box, growth_box)
+        for index in range(2, 12):
+            self.assertEqual(
+                _direct_tracking_round(
+                    accumulator,
+                    index=index,
+                    positive=stable,
+                    eligible=eligible,
+                ),
+                (),
+            )
+        before_growth = accumulator._tracking_regions()[0]
+        self.assertEqual(before_growth.revision, 1)
+        self.assertFalse(
+            np.any(_tracking_active_canvas(before_growth)[32:36, 38:42])
+        )
+
+        with_growth = _canvas_mask(seed_box, growth_box)
+        for index in (12, 13):
+            self.assertEqual(
+                _direct_tracking_round(
+                    accumulator,
+                    index=index,
+                    positive=with_growth,
+                    eligible=eligible,
+                ),
+                (),
+            )
+
+        grown = accumulator._tracking_regions()[0]
+        self.assertEqual(grown.candidate_id, "ui-anchor-000001")
+        self.assertEqual(grown.revision, 2)
+        self.assertTrue(
+            np.all(_tracking_active_canvas(grown)[32:36, 38:42])
+        )
+        self.assertEqual(grown.added_pixels, 16)
+        self.assertEqual(accumulator._candidate_sequence, 1)
+
+    def test_dynamic_mask_can_grow_stepwise_inside_the_fixed_growth_zone(
+        self,
+    ) -> None:
+        accumulator = ScreenLockedRegionAccumulator(
+            _refinement_policy(
+                maximum_observations=2,
+                no_growth_observations=1,
+                tracking_add_observations=2,
+            )
+        )
+        accumulator.reset("layout-a")
+        seed_box = (30, 30, 38, 38)
+        first_step_box = (38, 32, 39, 36)
+        second_step_box = (39, 32, 40, 36)
+        _set_opaque_candidate_evidence(
+            accumulator,
+            seed_box,
+            support=4,
+        )
+        _direct_promotion_round(accumulator, index=0)
+        completed = _direct_promotion_round(accumulator, index=1)
+        self.assertEqual(len(completed), 1)
+
+        first_step = _canvas_mask(seed_box, first_step_box)
+        eligible = _canvas_mask(first_step_box, second_step_box)
+        for index in (2, 3):
+            _direct_tracking_round(
+                accumulator,
+                index=index,
+                positive=first_step,
+                eligible=eligible,
+            )
+        first_revision = accumulator._tracking_regions()[0]
+        self.assertEqual(first_revision.revision, 2)
+        self.assertTrue(
+            np.all(
+                _tracking_active_canvas(first_revision)[
+                    first_step_box[1] : first_step_box[3],
+                    first_step_box[0] : first_step_box[2],
+                ]
+            )
+        )
+
+        second_step = _canvas_mask(
+            seed_box,
+            first_step_box,
+            second_step_box,
+        )
+        for index in (4, 5):
+            _direct_tracking_round(
+                accumulator,
+                index=index,
+                positive=second_step,
+                eligible=eligible,
+            )
+
+        second_revision = accumulator._tracking_regions()[0]
+        self.assertEqual(second_revision.revision, 3)
+        self.assertTrue(
+            np.all(
+                _tracking_active_canvas(second_revision)[
+                    second_step_box[1] : second_step_box[3],
+                    second_step_box[0] : second_step_box[2],
+                ]
+            )
+        )
+        self.assertEqual(second_revision.added_pixels, 4)
+        self.assertEqual(accumulator._candidate_sequence, 1)
+
+    def test_dynamic_mask_requires_reliable_consecutive_absence_to_shrink(
+        self,
+    ) -> None:
+        accumulator = ScreenLockedRegionAccumulator(
+            _refinement_policy(
+                maximum_observations=2,
+                no_growth_observations=1,
+                tracking_add_observations=2,
+                tracking_remove_observations=3,
+            )
+        )
+        accumulator.reset("layout-a")
+        seed_box = (60, 30, 68, 38)
+        removable_box = (68, 32, 70, 36)
+        _set_opaque_candidate_evidence(
+            accumulator,
+            seed_box,
+            support=4,
+        )
+        _direct_promotion_round(accumulator, index=0)
+        completed = _direct_promotion_round(accumulator, index=1)
+        self.assertEqual(len(completed), 1)
+
+        present = _canvas_mask(seed_box, removable_box)
+        eligible = _canvas_mask(removable_box)
+        for index in (2, 3):
+            _direct_tracking_round(
+                accumulator,
+                index=index,
+                positive=present,
+                eligible=eligible,
+            )
+        grown = accumulator._tracking_regions()[0]
+        self.assertEqual(grown.revision, 2)
+        self.assertTrue(
+            np.all(_tracking_active_canvas(grown)[32:36, 68:70])
+        )
+
+        seed_only = _canvas_mask(seed_box)
+        _direct_tracking_round(
+            accumulator,
+            index=4,
+            positive=seed_only,
+            eligible=eligible,
+        )
+        self.assertEqual(accumulator._tracking_regions()[0].revision, 2)
+
+        _direct_tracking_round(
+            accumulator,
+            index=5,
+            positive=seed_only,
+            eligible=np.zeros_like(eligible),
+        )
+        for index in (6, 7):
+            _direct_tracking_round(
+                accumulator,
+                index=index,
+                positive=seed_only,
+                eligible=eligible,
+            )
+        self.assertEqual(accumulator._tracking_regions()[0].revision, 2)
+
+        _direct_tracking_round(
+            accumulator,
+            index=8,
+            positive=present,
+            eligible=eligible,
+        )
+        for index in (9, 10, 11):
+            _direct_tracking_round(
+                accumulator,
+                index=index,
+                positive=seed_only,
+                eligible=eligible,
+            )
+        shrunk = accumulator._tracking_regions()[0]
+        self.assertEqual(shrunk.revision, 3)
+        self.assertEqual(shrunk.removed_pixels, 8)
+        self.assertFalse(
+            np.any(_tracking_active_canvas(shrunk)[32:36, 68:70])
+        )
+
+        for index in (12, 13):
+            self.assertEqual(
+                _direct_tracking_round(
+                    accumulator,
+                    index=index,
+                    positive=present,
+                    eligible=eligible,
+                ),
+                (),
+            )
+        restored = accumulator._tracking_regions()[0]
+        self.assertEqual(restored.candidate_id, "ui-anchor-000001")
+        self.assertEqual(restored.revision, 4)
+        self.assertEqual(restored.added_pixels, 8)
+        self.assertTrue(
+            np.all(_tracking_active_canvas(restored)[32:36, 68:70])
+        )
+        self.assertEqual(accumulator._candidate_sequence, 1)
+
+    def test_evidence_reset_preserves_active_mask_but_clears_partial_streaks(
+        self,
+    ) -> None:
+        accumulator = ScreenLockedRegionAccumulator(
+            _refinement_policy(
+                maximum_observations=2,
+                no_growth_observations=1,
+                tracking_remove_observations=2,
+            )
+        )
+        accumulator.reset("layout-a")
+        seed_box = (90, 30, 98, 38)
+        _set_opaque_candidate_evidence(
+            accumulator,
+            seed_box,
+            support=4,
+        )
+        _direct_promotion_round(accumulator, index=0)
+        _direct_promotion_round(accumulator, index=1)
+        active_before = accumulator._tracking_regions()[0].active_mask.copy()
+        eligible = _canvas_mask(seed_box)
+
+        _direct_tracking_round(
+            accumulator,
+            index=2,
+            positive=np.zeros_like(eligible),
+            eligible=eligible,
+        )
+        accumulator._reset_support_evidence(preserve_tracking=True)
+
+        retained = accumulator._tracking_regions()[0]
+        np.testing.assert_array_equal(retained.active_mask, active_before)
+        self.assertEqual(retained.revision, 1)
+        _direct_tracking_round(
+            accumulator,
+            index=3,
+            positive=np.zeros_like(eligible),
+            eligible=eligible,
+        )
+        self.assertEqual(accumulator._tracking_regions()[0].revision, 1)
+        _direct_tracking_round(
+            accumulator,
+            index=4,
+            positive=np.zeros_like(eligible),
+            eligible=eligible,
+        )
+        self.assertEqual(accumulator._tracking_regions()[0].revision, 2)
+        self.assertEqual(accumulator._tracking_regions()[0].active_pixels, 0)
+
     def test_refinement_disabled_keeps_immediate_promotion(self) -> None:
         policy = replace(
             _refinement_policy(),
@@ -827,7 +1162,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
 
         self.assertEqual(accumulator._refinement_tracks, {})
         self.assertFalse(np.any(accumulator._refining_mask))
-        self.assertFalse(np.any(accumulator._emitted_mask))
+        self.assertFalse(np.any(accumulator._tracking_mask))
         self.assertEqual(accumulator._candidate_sequence, 0)
 
         _set_opaque_candidate_evidence(
@@ -865,7 +1200,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
         )
 
         accumulator.reset("layout-a")
-        self.assertFalse(np.any(accumulator._emitted_mask))
+        self.assertFalse(np.any(accumulator._tracking_mask))
         _set_opaque_candidate_evidence(
             accumulator,
             (30, 30, 38, 38),
@@ -1089,7 +1424,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
         self.assertEqual(first.progress_regions, ())
         self.assertEqual(first.candidates, ())
 
-    def test_candidate_ids_remain_unique_across_scope_round_trip(self) -> None:
+    def test_scope_reset_starts_a_new_dynamic_run_with_unique_ids(self) -> None:
         accumulator = ScreenLockedRegionAccumulator(_policy())
         world = _textured_world()
         next_time_ms = 0
@@ -1123,14 +1458,17 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
             [candidate.candidate_id for candidate in second_scope],
             ["ui-anchor-000002"],
         )
-        self.assertEqual(repeated, [])
-        self.assertEqual(accumulator._candidate_sequence, 2)
+        self.assertEqual(
+            [candidate.candidate_id for candidate in repeated],
+            ["ui-anchor-000003"],
+        )
+        self.assertEqual(accumulator._candidate_sequence, 3)
         self.assertLessEqual(
             accumulator.retained_bytes,
             (19 + accumulator.policy.maximum_candidates) * _WIDTH * _HEIGHT,
         )
 
-    def test_evidence_ttl_clears_support_but_preserves_emitted_identity(
+    def test_evidence_ttl_clears_support_but_preserves_dynamic_tracking(
         self,
     ) -> None:
         policy = replace(_policy(), maximum_evidence_gap_ms=1_200)
@@ -1164,7 +1502,8 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
         self.assertEqual(gap.motion_episode_count, 0)
         self.assertEqual(gap.observed_direction_bins, ())
         self.assertEqual(accumulator._candidate_sequence, 1)
-        self.assertTrue(np.any(accumulator._emitted_mask))
+        self.assertTrue(np.any(accumulator._tracking_mask))
+        self.assertEqual(len(gap.tracking_regions), 1)
 
         repeated_candidates = []
         for sequence_index, offset in enumerate(_MOTION_OFFSETS, start=1):
@@ -1204,7 +1543,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
         accumulator._accumulate_vote(vote, vote, 400_000_000, 8)
         self.assertTrue(np.all(accumulator._episode_support_map[vote] == 2))
 
-    def test_expansion_of_an_emitted_component_is_not_promoted_again(self) -> None:
+    def test_expansion_updates_the_existing_dynamic_candidate(self) -> None:
         policy = replace(
             _policy(),
             support_target=2,
@@ -1245,10 +1584,23 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
             200,
             {},
         )
+        expanded_again = accumulator._promote_candidates(
+            rgb,
+            content,
+            "frame-expanded-again",
+            "layout-a",
+            300,
+            {},
+        )
         self.assertEqual(expanded, ())
+        self.assertEqual(expanded_again, ())
         self.assertEqual(accumulator._candidate_sequence, 1)
-        self.assertTrue(accumulator._emitted_mask[35, 41])
-        self.assertFalse(accumulator._emitted_mask[35, 57])
+        tracking = accumulator._tracking_regions()
+        self.assertEqual(len(tracking), 1)
+        active = _tracking_active_canvas(tracking[0])
+        self.assertTrue(active[35, 41])
+        self.assertTrue(active[35, 45])
+        self.assertFalse(active[35, 57])
 
     def test_progress_regions_keep_ids_while_evidence_converges_to_core(
         self,
@@ -1622,7 +1974,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
 
         support_before = accumulator._support_map.copy()
         eligible_before = accumulator._eligible_map.copy()
-        emitted_before = accumulator._emitted_mask.copy()
+        tracking_before = accumulator._tracking_mask.copy()
         regions = accumulator._progress_regions()
 
         self.assertEqual(len(regions), 8)
@@ -1633,7 +1985,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
         self.assertLessEqual(len(accumulator._progress_tracks), 8)
         self.assertTrue(np.array_equal(accumulator._support_map, support_before))
         self.assertTrue(np.array_equal(accumulator._eligible_map, eligible_before))
-        self.assertTrue(np.array_equal(accumulator._emitted_mask, emitted_before))
+        self.assertTrue(np.array_equal(accumulator._tracking_mask, tracking_before))
         self.assertEqual(accumulator._candidate_sequence, 0)
 
         comparison = ScreenLockedRegionAccumulator(accumulator.policy)
@@ -1802,7 +2154,7 @@ class ScreenLockedRegionAccumulatorTests(unittest.TestCase):
         self.assertFalse(np.any(candidate.stable_core_mask & candidate.volatile_mask))
 
         analysis_pixels = _WIDTH * _HEIGHT
-        self.assertLessEqual(accumulator.retained_bytes, 46 * analysis_pixels)
+        self.assertLessEqual(accumulator.retained_bytes, 50 * analysis_pixels)
 
 
 if __name__ == "__main__":

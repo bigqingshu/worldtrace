@@ -151,6 +151,8 @@ class AdvancedTraceSettings:
     ui_anchor_refinement_max_observations: int = 20
     ui_anchor_refinement_no_growth_observations: int = 5
     ui_anchor_refinement_expansion_radius_px: int = 4
+    ui_anchor_tracking_add_observations: int = 2
+    ui_anchor_tracking_remove_observations: int = 8
 
     _MAX_SIGNATURE_BYTES = 128 * 1024 * 1024
 
@@ -216,6 +218,8 @@ class AdvancedTraceSettings:
             "ui_anchor_refinement_max_observations",
             "ui_anchor_refinement_no_growth_observations",
             "ui_anchor_refinement_expansion_radius_px",
+            "ui_anchor_tracking_add_observations",
+            "ui_anchor_tracking_remove_observations",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -474,6 +478,12 @@ class AdvancedTraceSettings:
             raise ValueError(
                 "ui_anchor_refinement_expansion_radius_px cannot exceed 16"
             )
+        for name in (
+            "ui_anchor_tracking_add_observations",
+            "ui_anchor_tracking_remove_observations",
+        ):
+            if getattr(self, name) > 500:
+                raise ValueError(f"{name} cannot exceed 500")
         if self.ui_anchor_strong_changed_ratio < self.ui_anchor_minimum_changed_ratio:
             raise ValueError(
                 "UI anchor strong change ratio cannot be below minimum change ratio"
@@ -560,10 +570,12 @@ class AdvancedTraceSettings:
             f"同点位去重={'开' if self.icon_same_slot_dedup_enabled else '关'}；"
             f"UI锚点 320×180 / {self.ui_anchor_support_target} 次 / "
             f"半透明形状={'开' if self.ui_anchor_translucent_enabled else '关'} / "
-            f"掩码补充={'开' if self.ui_anchor_refinement_enabled else '关'}"
+            f"首次掩码补充={'开' if self.ui_anchor_refinement_enabled else '关'}"
             f"（{self.ui_anchor_refinement_max_observations} 次 / "
             f"无新增 {self.ui_anchor_refinement_no_growth_observations} 次 / "
             f"{self.ui_anchor_refinement_expansion_radius_px} px） / "
+            f"动态掩码=持续（加入 {self.ui_anchor_tracking_add_observations} 次 / "
+            f"可靠缺失移除 {self.ui_anchor_tracking_remove_observations} 次） / "
             f"{self.ui_anchor_minimum_motion_episodes} 个运动阶段 / "
             f"模型内点 {self.ui_anchor_minimum_flow_model_inlier_ratio:.0%} / "
             f"边侧 {self.ui_anchor_minimum_flow_perimeter_sides}/4 / "
@@ -797,13 +809,15 @@ class AdvancedSettingsDialog(QDialog):
         trigger_columns.addWidget(trigger_right_widget, 1)
         root.addWidget(trigger_group)
 
-        template_group = QGroupBox("SAM 模板登记与稳定帧核验")
+        template_group = QGroupBox("SAM 预览、模板登记与稳定帧核验")
         template_columns = QHBoxLayout(template_group)
         template_left_widget = QWidget()
         template_right_widget = QWidget()
         template_left = QFormLayout(template_left_widget)
         template_right = QFormLayout(template_right_widget)
-        self.icon_sam_enabled_check = QCheckBox("候选保存后异步生成掩码预览")
+        self.icon_sam_enabled_check = QCheckBox(
+            "启用自动 HUD 与手动 UI 锚点掩码预览"
+        )
         self.icon_sam_device_combo = QComboBox()
         self.icon_sam_device_combo.addItem("第二块 GPU（cuda:1）", "cuda:1")
         self.icon_sam_device_combo.addItem("第一块 GPU（cuda:0）", "cuda:0")
@@ -816,8 +830,9 @@ class AdvancedSettingsDialog(QDialog):
         self.icon_match_absent_score_spin = self._percentage()
         self.icon_match_present_score_spin = self._percentage()
         self.icon_sam_enabled_check.setToolTip(
-            "SAM 只处理已确认并保存的候选裁剪，不处理普通采样帧；"
-            "模板必须在主界面人工接受后才参与核验。"
+            "自动路径只处理已确认并保存的 HUD 候选裁剪；手动路径只处理"
+            "用户点击时冻结的 UI 锚点掩码。两者都不处理普通采样帧，"
+            "模板仍必须在主界面人工接受后才参与核验。"
         )
         self.icon_template_matching_check.setToolTip(
             "每次大变化只在画面重新安静后核验一次；输出 "
@@ -1101,15 +1116,15 @@ class AdvancedSettingsDialog(QDialog):
         )
         root.addWidget(translucent_group)
 
-        refinement_group = QGroupBox("晋升后掩码补充（实验）")
+        refinement_group = QGroupBox("首次确认与动态掩码（实验）")
         refinement_form = QFormLayout(refinement_group)
         self.ui_anchor_refinement_enabled_check = QCheckBox(
-            "启用种子掩码增量补充"
+            "启用首次种子掩码增量补充"
         )
         self.ui_anchor_refinement_enabled_check.setToolTip(
             "首次达到晋升门槛后先保留不可缩小的种子；"
             "只用随后通过世界运动门禁的观察补充邻近像素，"
-            "补充结束后才保存一次最终候选。"
+            "达到首次确认条件后生成候选；候选的动态掩码随后仍继续更新。"
         )
         self.ui_anchor_refinement_max_observations_spin = self._integer(
             1,
@@ -1134,18 +1149,42 @@ class AdvancedSettingsDialog(QDialog):
             "相对最初种子掩码允许向外补充的固定半径；"
             "不会围绕新增像素继续递归扩张。"
         )
+        self.ui_anchor_tracking_add_observations_spin = self._integer(
+            1,
+            500,
+        )
+        self.ui_anchor_tracking_add_observations_spin.setToolTip(
+            "候选进入动态跟踪后，一个点位连续多少次获得通过门禁的"
+            "正证据，才加入当前掩码；首次确认结束后仍持续生效。"
+        )
+        self.ui_anchor_tracking_remove_observations_spin = self._integer(
+            1,
+            500,
+        )
+        self.ui_anchor_tracking_remove_observations_spin.setToolTip(
+            "候选进入动态跟踪后，一个点位连续多少次在通过门禁且证据"
+            "可判定时可靠缺失，才从当前掩码移除；门禁未通过或未知不累计。"
+        )
         refinement_form.addRow(self.ui_anchor_refinement_enabled_check)
         refinement_form.addRow(
-            "最多补充观察",
+            "首次确认最多补充观察",
             self.ui_anchor_refinement_max_observations_spin,
         )
         refinement_form.addRow(
-            "连续无新增结束",
+            "首次确认连续无新增结束",
             self.ui_anchor_refinement_no_growth_observations_spin,
         )
         refinement_form.addRow(
             "最大向外扩展",
             self.ui_anchor_refinement_expansion_radius_spin,
+        )
+        refinement_form.addRow(
+            "动态加入连续命中",
+            self.ui_anchor_tracking_add_observations_spin,
+        )
+        refinement_form.addRow(
+            "动态移除可靠缺失",
+            self.ui_anchor_tracking_remove_observations_spin,
         )
         root.addWidget(refinement_group)
         root.addStretch(1)
@@ -1488,6 +1527,12 @@ class AdvancedSettingsDialog(QDialog):
         self.ui_anchor_refinement_expansion_radius_spin.setValue(
             settings.ui_anchor_refinement_expansion_radius_px
         )
+        self.ui_anchor_tracking_add_observations_spin.setValue(
+            settings.ui_anchor_tracking_add_observations
+        )
+        self.ui_anchor_tracking_remove_observations_spin.setValue(
+            settings.ui_anchor_tracking_remove_observations
+        )
         self._update_ui_anchor_translucent_controls()
         self._update_ui_anchor_refinement_controls()
         self.quiet_confirm_spin.setEnabled(
@@ -1718,6 +1763,12 @@ class AdvancedSettingsDialog(QDialog):
             ),
             ui_anchor_refinement_expansion_radius_px=(
                 self.ui_anchor_refinement_expansion_radius_spin.value()
+            ),
+            ui_anchor_tracking_add_observations=(
+                self.ui_anchor_tracking_add_observations_spin.value()
+            ),
+            ui_anchor_tracking_remove_observations=(
+                self.ui_anchor_tracking_remove_observations_spin.value()
             ),
         )
 

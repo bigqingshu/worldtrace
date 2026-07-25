@@ -20,6 +20,7 @@ from experiments.minimal_trace_gui.ui_anchor_discovery import (
     UiAnchorProgressRegion,
     UiAnchorProgressStage,
     UiAnchorRefinementRegion,
+    UiAnchorTrackingRegion,
 )
 from experiments.minimal_trace_gui.ui_anchor_session import (
     UiAnchorDiscoverySession,
@@ -31,13 +32,14 @@ from experiments.minimal_trace_gui.ui_anchor_store import (
 
 
 class _FakeAccumulator:
-    ALGORITHM_REVISION = 3
+    ALGORITHM_REVISION = 4
 
     def __init__(
         self,
         *,
         promote_frame_ids: set[str] | None = None,
         refining_frame_ids: set[str] | None = None,
+        tracking_frame_ids: set[str] | None = None,
         blocked_frame_id: str | None = None,
         candidate_count: int = 1,
     ) -> None:
@@ -49,6 +51,7 @@ class _FakeAccumulator:
         )
         self.promote_frame_ids = set(promote_frame_ids or ())
         self.refining_frame_ids = set(refining_frame_ids or ())
+        self.tracking_frame_ids = set(tracking_frame_ids or ())
         self.blocked_frame_id = blocked_frame_id
         self.candidate_count = candidate_count
         self.block_entered = threading.Event()
@@ -57,6 +60,8 @@ class _FakeAccumulator:
         self._reset_scope_ids: list[str | None] = []
         self._observed_frame_ids: list[str] = []
         self._analyses: dict[str, UiAnchorAnalysis] = {}
+        self._dynamic_candidate_id = "ui-anchor-dynamic"
+        self._dynamic_revision = 0
 
     @property
     def reset_scope_ids(self) -> tuple[str | None, ...]:
@@ -111,6 +116,17 @@ class _FakeAccumulator:
         refinement_regions = ()
         if frame_id in self.refining_frame_ids:
             refinement_regions = (self._refinement_region(),)
+        tracking_regions = ()
+        if frame_id in self.tracking_frame_ids:
+            self._dynamic_revision += 1
+            if candidates:
+                self._dynamic_candidate_id = candidates[0].candidate_id
+            tracking_regions = (
+                self._tracking_region(
+                    candidate_id=self._dynamic_candidate_id,
+                    revision=self._dynamic_revision,
+                ),
+            )
         analysis = UiAnchorAnalysis(
             frame_id=frame_id,
             scope_id=scope_id,
@@ -141,6 +157,7 @@ class _FakeAccumulator:
             maximum_translucent_support=1,
             support_target=self.policy.support_target,
             refinement_regions=refinement_regions,
+            tracking_regions=tracking_regions,
             candidates=candidates,
         )
         with self._lock:
@@ -163,6 +180,34 @@ class _FakeAccumulator:
             no_growth_observations=1,
             no_growth_target=5,
             expansion_radius_px=4,
+        )
+
+    @staticmethod
+    def _tracking_region(
+        *,
+        candidate_id: str,
+        revision: int,
+    ) -> UiAnchorTrackingRegion:
+        base = np.zeros((8, 8), dtype=np.bool_)
+        active = np.zeros_like(base)
+        added = np.zeros_like(base)
+        removed = np.zeros_like(base)
+        base[2:4, 2:4] = True
+        active |= base
+        if revision > 1:
+            active[2:4, 4:6] = True
+            added[2:4, 4:6] = True
+        return UiAnchorTrackingRegion(
+            candidate_id=candidate_id,
+            bbox_canvas=(4, 4, 12, 12),
+            base_mask=base,
+            active_mask=active,
+            added_mask=added,
+            removed_mask=removed,
+            revision=revision,
+            observations=revision,
+            add_observation_target=2,
+            remove_observation_target=8,
         )
 
     def _candidate(
@@ -441,6 +486,14 @@ class UiAnchorDiscoverySessionTests(unittest.TestCase):
         self.assertEqual(preview.scope_id, analysis.scope_id)
         self.assertIs(preview.analysis, analysis)
         self.assertFalse(preview.rgb_pixels.flags.writeable)
+        self.assertIs(preview.source_frame, frame)
+        self.assertIsNotNone(preview.canvas_rgb_pixels)
+        assert preview.canvas_rgb_pixels is not None
+        self.assertFalse(preview.canvas_rgb_pixels.flags.writeable)
+        self.assertTrue(np.all(preview.canvas_rgb_pixels == 35))
+        self.assertFalse(
+            np.array_equal(preview.canvas_rgb_pixels, preview.rgb_pixels)
+        )
         self.assertEqual(session.stats().flow_model_inlier_ratio, 0.8)
         self.assertEqual(session.stats().moving_flow_perimeter_sides, 3)
         self.assertEqual(session.stats().maximum_translucent_support, 1)
@@ -557,6 +610,63 @@ class UiAnchorDiscoverySessionTests(unittest.TestCase):
         np.testing.assert_array_equal(preview[67, 114], (137, 58, 122))
         np.testing.assert_array_equal(preview[67, 111], (20, 20, 20))
 
+    def test_preview_distinguishes_dynamic_active_added_and_removed_pixels(
+        self,
+    ) -> None:
+        source = np.full((180, 320, 3), 20, dtype=np.uint8)
+        base = np.zeros((20, 24), dtype=np.bool_)
+        active = np.zeros_like(base)
+        added = np.zeros_like(base)
+        removed = np.zeros_like(base)
+        base[5:10, 5:10] = True
+        active[5:10, 5:10] = True
+        active[5:10, 12:17] = True
+        added[5:10, 12:17] = True
+        removed[12:15, 5:10] = True
+        region = UiAnchorTrackingRegion(
+            candidate_id="ui-anchor-000001",
+            bbox_canvas=(100, 60, 124, 80),
+            base_mask=base,
+            active_mask=active,
+            added_mask=added,
+            removed_mask=removed,
+            revision=3,
+            observations=27,
+            add_observation_target=2,
+            remove_observation_target=8,
+        )
+        analysis = UiAnchorAnalysis(
+            frame_id="frame-tracking",
+            scope_id="scope-tracking",
+            motion_state=UiAnchorMotionState.MOTION,
+            reason_code="DYNAMIC_MASK_UPDATED",
+            motion_qualified=True,
+            changed_ratio=0.25,
+            mean_difference=12.0,
+            active_motion_cells=8,
+            valid_flow_tracks=40,
+            moving_flow_ratio=0.75,
+            eligible_observations=60,
+            motion_episode_count=2,
+            observed_direction_bins=(0, 3),
+            maximum_support=60,
+            maximum_opaque_support=60,
+            maximum_translucent_support=21,
+            support_target=50,
+            tracking_regions=(region,),
+        )
+
+        preview = UiAnchorDiscoverySession._draw_preview(source, analysis)
+
+        np.testing.assert_array_equal(source, np.full_like(source, 20))
+        self.assertFalse(region.active_mask.flags.writeable)
+        self.assertFalse(region.added_mask.flags.writeable)
+        self.assertFalse(region.removed_mask.flags.writeable)
+        np.testing.assert_array_equal(preview[67, 107], (40, 92, 75))
+        np.testing.assert_array_equal(preview[67, 114], (165, 67, 146))
+        np.testing.assert_array_equal(preview[73, 107], (179, 82, 55))
+        np.testing.assert_array_equal(preview[67, 111], (20, 20, 20))
+
     def test_refinement_waits_before_writing_and_completes_exactly_once(
         self,
     ) -> None:
@@ -631,6 +741,42 @@ class UiAnchorDiscoverySessionTests(unittest.TestCase):
         ]
         self.assertEqual(len(recorded_events), 1)
         self.assertEqual(recorded_events[0].frame_id, promoted.frame_id)
+
+    def test_dynamic_revisions_update_preview_but_persist_only_once(self) -> None:
+        first = make_frame(20, time_ms=0, frame_number=1)
+        second = make_frame(30, time_ms=100, frame_number=2)
+        accumulator = _FakeAccumulator(
+            promote_frame_ids={first.frame_id},
+            tracking_frame_ids={first.frame_id, second.frame_id},
+        )
+        writer = _RecordingWriter()
+        session = UiAnchorDiscoverySession(accumulator, writer)
+        session.start()
+        try:
+            self.assertTrue(session.submit(first))
+            self._wait_until(lambda: session.stats().persisted_candidates == 1)
+            self.assertTrue(session.submit(second))
+            self._wait_until(lambda: session.stats().analyzed_samples == 2)
+            preview = session.previews.get_nowait()
+        finally:
+            session.request_stop()
+            self.assertTrue(session.join(timeout=1.0))
+
+        self.assertEqual(len(writer.saved_candidates), 1)
+        self.assertEqual(session.stats().promoted_candidates, 1)
+        self.assertEqual(session.stats().persisted_candidates, 1)
+        self.assertEqual(session.stats().tracking_regions, 1)
+        self.assertEqual(preview.frame_id, second.frame_id)
+        self.assertEqual(len(preview.analysis.tracking_regions), 1)
+        tracking = preview.analysis.tracking_regions[0]
+        self.assertEqual(tracking.revision, 2)
+        self.assertEqual(tracking.added_pixels, 4)
+        recorded_events = [
+            event
+            for event in self._drain(session.events)
+            if event.status is UiAnchorEventStatus.CANDIDATE_RECORDED
+        ]
+        self.assertEqual(len(recorded_events), 1)
 
     def test_writer_failure_degrades_only_the_sidecar_session(self) -> None:
         frame = make_frame(10, time_ms=0, frame_number=1)

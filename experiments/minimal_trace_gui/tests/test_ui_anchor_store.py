@@ -147,7 +147,7 @@ class UiAnchorCandidateStoreTests(unittest.TestCase):
             self.assertFalse(metadata["semantic_contract"]["is_actionable_control"])
             self.assertEqual(
                 metadata["discovery"]["algorithm"],
-                "screen-locked-motion-vote-anchor.v3",
+                "screen-locked-motion-vote-anchor.v4",
             )
             self.assertIn("not_a_ui_state", metadata["limitations"])
             self.assertIn("not_an_icon_identification", metadata["limitations"])
@@ -156,7 +156,11 @@ class UiAnchorCandidateStoreTests(unittest.TestCase):
                 metadata["limitations"],
             )
             self.assertIn(
-                "stable_mask_may_include_bounded_post_promotion_growth",
+                "stable_mask_is_initial_dynamic_tracking_baseline",
+                metadata["limitations"],
+            )
+            self.assertIn(
+                "dynamic_tracking_revisions_are_memory_only",
                 metadata["limitations"],
             )
             self.assertEqual(store.persisted_candidates, 1)

@@ -42,8 +42,11 @@ from experiments.minimal_trace_gui.icon_recorder import (
     IconRecordStatus,
 )
 from experiments.minimal_trace_gui.icon_segmentation import (
+    IconSegmentationResult,
     IconSegmentationQaStatus,
     IconSegmentationStatus,
+    evaluate_icon_segmentation,
+    unresolved_icon_segmentation_result,
 )
 from experiments.minimal_trace_gui.icon_template_matcher import (
     IconPresence,
@@ -54,7 +57,12 @@ from experiments.minimal_trace_gui.keyframe_session import KeyframeSessionStats
 from experiments.minimal_trace_gui.ui_anchor_session import (
     UiAnchorEvent,
     UiAnchorEventStatus,
+    UiAnchorPreview,
 )
+from experiments.minimal_trace_gui.ui_anchor_sam_preview import (
+    UiAnchorSamPreviewEvent,
+)
+from experiments.minimal_trace_gui.tests.helpers import make_frame
 
 
 class _FakeCaptureSession:
@@ -114,6 +122,28 @@ class _FakeKeyframeSession:
         return KeyframeSessionStats()
 
 
+class _FakeUiAnchorSamSession:
+    def __init__(self, batch) -> None:
+        self.batch = batch
+        self.results = queue.Queue()
+        self.is_alive = False
+        self.started = False
+        self.stop_requested = False
+        self.failure = None
+
+    def start(self) -> None:
+        self.started = True
+        self.is_alive = True
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        self.is_alive = False
+
+    def join(self, timeout=None) -> bool:
+        del timeout
+        return not self.is_alive
+
+
 def _wgc_capability() -> BackendCapabilities:
     return BackendCapabilities(
         backend_id="wgc",
@@ -164,6 +194,107 @@ def _custom_ui_anchor_settings() -> AdvancedTraceSettings:
         ui_anchor_refinement_max_observations=33,
         ui_anchor_refinement_no_growth_observations=7,
         ui_anchor_refinement_expansion_radius_px=6,
+        ui_anchor_tracking_add_observations=5,
+        ui_anchor_tracking_remove_observations=13,
+    )
+
+
+def _sam_ready_ui_anchor_preview(
+    *,
+    frame_number: int = 1,
+    scope_id: str = "layout-a",
+    second_target: bool = False,
+) -> UiAnchorPreview:
+    source = np.full((360, 640, 3), 40 + frame_number, dtype=np.uint8)
+    frame = make_frame(
+        source,
+        time_ms=frame_number * 100,
+        frame_number=frame_number,
+        session_id=scope_id,
+    )
+
+    def region(
+        region_id: str,
+        bbox: tuple[int, int, int, int],
+    ) -> SimpleNamespace:
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        mask = np.zeros((height, width), dtype=np.bool_)
+        mask[5 : height - 5, 5 : width - 5] = True
+        return SimpleNamespace(
+            region_id=region_id,
+            evidence_bbox_canvas=bbox,
+            core_mask=mask,
+            translucent_core_mask=np.zeros_like(mask),
+            stage=SimpleNamespace(value="READY"),
+            support_count=50,
+            support_target=50,
+            support_ratio=0.95,
+            independent_motion_episodes=2,
+            motion_direction_bins=(0, 3),
+            direction_diversity=2,
+            completion=1.0,
+            blocking_reason=SimpleNamespace(value="READY_FOR_PROMOTION_CHECK"),
+        )
+
+    regions = [region("R1", (270, 135, 315, 178))]
+    if second_target:
+        regions.insert(0, region("R2", (20, 20, 65, 65)))
+    analysis = SimpleNamespace(
+        frame_id=frame.frame_id,
+        scope_id=scope_id,
+        progress_regions=tuple(regions),
+        refinement_regions=(),
+        candidates=(),
+    )
+    canvas = np.full((180, 320, 3), 50, dtype=np.uint8)
+    return UiAnchorPreview(
+        frame_id=frame.frame_id,
+        scope_id=scope_id,
+        rgb_pixels=canvas,
+        analysis=analysis,
+        canvas_rgb_pixels=canvas,
+        source_frame=frame,
+    )
+
+
+def _ui_anchor_sam_event(batch, index: int, *, succeeded: bool):
+    item = batch.items[index]
+    request = item.request
+    if succeeded:
+        mask = np.zeros(
+            (request.prompt.crop_height, request.prompt.crop_width),
+            dtype=np.bool_,
+        )
+        x1, y1, x2, y2 = request.prompt.selection_box
+        mask[y1:y2, x1:x2] = True
+        overlay = request.crop_rgb.copy()
+        overlay[mask] = (32, 220, 96)
+        result = IconSegmentationResult(
+            request=request,
+            status=IconSegmentationStatus.SUCCEEDED,
+            reason_code="SAM_SEGMENTATION_SUCCEEDED",
+            mask=mask,
+            overlay_rgb=overlay,
+            score=0.93,
+            selected_index=1,
+            qa=evaluate_icon_segmentation(mask, request.prompt),
+        )
+    else:
+        result = unresolved_icon_segmentation_result(
+            request,
+            IconSegmentationStatus.FAILED,
+            "TEST_SAM_FAILURE",
+            error="synthetic failure",
+        )
+    return UiAnchorSamPreviewEvent(
+        batch_id=batch.batch_id,
+        item_index=index,
+        item_count=len(batch.items),
+        item=item,
+        result=result,
+        started_at_monotonic_ns=10,
+        completed_at_monotonic_ns=20,
     )
 
 
@@ -202,9 +333,41 @@ class MinimalTraceWindowTests(unittest.TestCase):
             self.assertTrue(window.start_button.isEnabled())
             self.assertFalse(hasattr(window, "save_button"))
             self.assertFalse(window.ui_anchor_export_button.isEnabled())
+            self.assertFalse(
+                window.ui_anchor_source_overlay_button.isEnabled()
+            )
+            self.assertFalse(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertFalse(window.ui_anchor_sam_preview_button.isEnabled())
             self.assertIn(
                 "手动操作",
                 window.ui_anchor_export_button.toolTip(),
+            )
+            self.assertIn(
+                "不改变 UI 状态",
+                window.ui_anchor_sam_preview_button.toolTip(),
+            )
+            self.assertIn(
+                "不调用 SAM",
+                window.ui_anchor_source_overlay_button.toolTip(),
+            )
+            self.assertIn(
+                "已经冻结",
+                window.ui_anchor_source_overlay_export_button.toolTip(),
+            )
+            self.assertFalse(window.ui_anchor_sam_result_combo.isEnabled())
+            self.assertGreaterEqual(
+                window.evidence_tabs.indexOf(
+                    window.ui_anchor_source_overlay_group
+                ),
+                0,
+            )
+            self.assertGreaterEqual(
+                window.evidence_tabs.indexOf(
+                    window.ui_anchor_sam_preview_group
+                ),
+                0,
             )
             self.assertIn("普通帧不落盘", window.mode_hint.text())
             self.assertIs(
@@ -214,6 +377,307 @@ class MinimalTraceWindowTests(unittest.TestCase):
             self.assertEqual(
                 window.ui_anchor_detail_label.text(),
                 "等待 UI 锚点分析详情",
+            )
+        finally:
+            window.close()
+
+    def test_ui_anchor_source_overlay_freezes_current_source_and_scope_reset_clears(
+        self,
+    ) -> None:
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        bridge = _FakeKeyframeSession()
+        first = _sam_ready_ui_anchor_preview(frame_number=1)
+        second = _sam_ready_ui_anchor_preview(frame_number=2)
+        bridge.ui_anchor_previews.put(first)
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            self.assertTrue(
+                window.ui_anchor_source_overlay_button.isEnabled()
+            )
+
+            window._show_ui_anchor_source_overlay()
+
+            self.assertIs(
+                window.evidence_tabs.currentWidget(),
+                window.ui_anchor_source_overlay_group,
+            )
+            image = window._ui_anchor_source_overlay_image
+            self.assertIsNotNone(image)
+            assert image is not None
+            self.assertEqual((image.width(), image.height()), (640, 360))
+            self.assertTrue(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertEqual(
+                window._ui_anchor_source_overlay_frame_id,
+                first.frame_id,
+            )
+            self.assertEqual(
+                window._ui_anchor_source_overlay_scope_id,
+                first.scope_id,
+            )
+            self.assertIn(
+                first.frame_id,
+                window.ui_anchor_source_overlay_detail_label.text(),
+            )
+            self.assertIn(
+                "不自动写盘",
+                window.ui_anchor_source_overlay_detail_label.text(),
+            )
+
+            bridge.ui_anchor_previews.put(second)
+            window._drain_ui_anchor_previews(bridge)
+            self.assertIn(
+                first.frame_id,
+                window.ui_anchor_source_overlay_detail_label.text(),
+            )
+            self.assertTrue(
+                window.ui_anchor_source_overlay_button.isEnabled()
+            )
+            self.assertEqual(
+                window._ui_anchor_source_overlay_frame_id,
+                first.frame_id,
+            )
+
+            window._show_ui_anchor_source_overlay()
+            self.assertEqual(
+                window._ui_anchor_source_overlay_frame_id,
+                second.frame_id,
+            )
+            self.assertIn(
+                second.frame_id,
+                window.ui_anchor_source_overlay_detail_label.text(),
+            )
+
+            window._activate_ui_anchor_scope("layout-new")
+            self.assertIsNone(window._ui_anchor_source_overlay_image)
+            self.assertIsNone(window._ui_anchor_source_overlay_frame_id)
+            self.assertIsNone(window._ui_anchor_source_overlay_scope_id)
+            self.assertFalse(
+                window.ui_anchor_source_overlay_button.isEnabled()
+            )
+            self.assertFalse(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertEqual(
+                window.ui_anchor_source_overlay_preview.text(),
+                "请先在 UI 锚点页生成掩码，再手动映射到源帧",
+            )
+        finally:
+            window.close()
+
+    def test_ui_anchor_source_overlay_is_independent_from_sam_settings_and_session(
+        self,
+    ) -> None:
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        bridge = _FakeKeyframeSession()
+        bridge.ui_anchor_previews.put(_sam_ready_ui_anchor_preview())
+        sam_session = _FakeUiAnchorSamSession(batch=None)
+        sam_session.is_alive = True
+        window._advanced_settings = replace(
+            window._advanced_settings,
+            icon_sam_enabled=False,
+        )
+        window._ui_anchor_sam_session = sam_session
+        try:
+            window._drain_ui_anchor_previews(bridge)
+
+            self.assertTrue(window.ui_anchor_source_overlay_button.isEnabled())
+            self.assertFalse(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertFalse(window.ui_anchor_sam_preview_button.isEnabled())
+
+            window._show_ui_anchor_source_overlay()
+
+            self.assertIsNotNone(window._ui_anchor_source_overlay_image)
+            self.assertTrue(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertIs(window._ui_anchor_sam_session, sam_session)
+            self.assertFalse(sam_session.stop_requested)
+        finally:
+            window.close()
+
+    def test_ui_anchor_source_overlay_survives_stop_and_remains_clickable(
+        self,
+    ) -> None:
+        capture = _FakeCaptureSession()
+        keyframes = _FakeKeyframeSession()
+        keyframes.ui_anchor_previews.put(_sam_ready_ui_anchor_preview())
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        window._capture_session = capture
+        window._keyframe_session = keyframes
+        try:
+            window._drain_ui_anchor_previews(keyframes)
+            window._show_ui_anchor_source_overlay()
+            retained_image = window._ui_anchor_source_overlay_image
+            retained_detail = window.ui_anchor_source_overlay_detail_label.text()
+
+            window._finalize_stopped()
+
+            self.assertIs(window._ui_anchor_source_overlay_image, retained_image)
+            self.assertEqual(
+                window.ui_anchor_source_overlay_detail_label.text(),
+                retained_detail,
+            )
+            self.assertTrue(window.ui_anchor_source_overlay_button.isEnabled())
+            self.assertTrue(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+
+            window.evidence_tabs.setCurrentWidget(window.keyframe_preview_group)
+            window._show_ui_anchor_source_overlay()
+            self.assertIs(
+                window.evidence_tabs.currentWidget(),
+                window.ui_anchor_source_overlay_group,
+            )
+            self.assertIsNotNone(window._ui_anchor_source_overlay_image)
+        finally:
+            window.close()
+
+    def test_reset_run_display_clears_ui_anchor_source_overlay(self) -> None:
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        bridge = _FakeKeyframeSession()
+        bridge.ui_anchor_previews.put(_sam_ready_ui_anchor_preview())
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            window._show_ui_anchor_source_overlay()
+            self.assertIsNotNone(window._ui_anchor_source_overlay_image)
+
+            window._reset_run_display()
+
+            self.assertIsNone(window._ui_anchor_source_overlay_image)
+            self.assertIsNone(window._ui_anchor_source_overlay_frame_id)
+            self.assertIsNone(window._ui_anchor_source_overlay_scope_id)
+            self.assertIsNone(window._ui_anchor_preview_snapshot)
+            self.assertFalse(window.ui_anchor_source_overlay_button.isEnabled())
+            self.assertFalse(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertEqual(
+                window.ui_anchor_source_overlay_preview.text(),
+                "请先在 UI 锚点页生成掩码，再手动映射到源帧",
+            )
+            self.assertEqual(
+                window.ui_anchor_source_overlay_detail_label.text(),
+                "尚未生成源帧覆盖；结果只用于人工核对映射",
+            )
+        finally:
+            window.close()
+
+    def test_ui_anchor_source_overlay_export_is_lossless_and_click_atomic(
+        self,
+    ) -> None:
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        bridge = _FakeKeyframeSession()
+        first = _sam_ready_ui_anchor_preview(frame_number=1)
+        second = _sam_ready_ui_anchor_preview(frame_number=2)
+        bridge.ui_anchor_previews.put(first)
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            window._show_ui_anchor_source_overlay()
+            frozen_image = window._ui_anchor_source_overlay_image
+            self.assertIsNotNone(frozen_image)
+            assert frozen_image is not None
+            frozen_image = frozen_image.copy()
+
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                selected_path = Path(temporary_directory) / "source-overlay"
+                dialog_paths = []
+
+                def choose_after_new_overlay(_parent, default_path):
+                    dialog_paths.append(default_path)
+                    bridge.ui_anchor_previews.put(second)
+                    window._drain_ui_anchor_previews(bridge)
+                    window._show_ui_anchor_source_overlay()
+                    return str(selected_path)
+
+                window._ui_anchor_source_overlay_export_path_provider = (
+                    choose_after_new_overlay
+                )
+                window._export_ui_anchor_source_overlay()
+
+                exported_path = selected_path.with_suffix(".png")
+                self.assertTrue(exported_path.is_file())
+                exported = QImage(str(exported_path))
+                self.assertFalse(exported.isNull())
+                self.assertEqual(
+                    (exported.width(), exported.height()),
+                    (frozen_image.width(), frozen_image.height()),
+                )
+                for x, y in ((0, 0), (600, 300)):
+                    self.assertEqual(
+                        exported.pixelColor(x, y).getRgb()[:3],
+                        frozen_image.pixelColor(x, y).getRgb()[:3],
+                    )
+                current_image = window._ui_anchor_source_overlay_image
+                self.assertIsNotNone(current_image)
+                assert current_image is not None
+                self.assertNotEqual(
+                    current_image.pixelColor(0, 0).getRgb()[:3],
+                    frozen_image.pixelColor(0, 0).getRgb()[:3],
+                )
+                self.assertEqual(
+                    window._ui_anchor_source_overlay_frame_id,
+                    second.frame_id,
+                )
+                self.assertIn(
+                    window._safe_export_filename_component(first.frame_id),
+                    str(dialog_paths[0]),
+                )
+                log = window.log_view.toPlainText()
+                self.assertIn(str(exported_path), log)
+                self.assertIn(f"frame {first.frame_id}", log)
+                self.assertIn(f"scope {first.scope_id}", log)
+        finally:
+            window.close()
+
+    def test_ui_anchor_source_overlay_export_cancel_writes_nothing(
+        self,
+    ) -> None:
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        bridge = _FakeKeyframeSession()
+        bridge.ui_anchor_previews.put(_sam_ready_ui_anchor_preview())
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            window._show_ui_anchor_source_overlay()
+            image = window._ui_anchor_source_overlay_image
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                window._ui_anchor_source_overlay_export_path_provider = (
+                    lambda _parent, _default_path: ""
+                )
+                window._export_ui_anchor_source_overlay()
+
+                self.assertEqual(
+                    tuple(Path(temporary_directory).iterdir()),
+                    (),
+                )
+            self.assertIs(window._ui_anchor_source_overlay_image, image)
+            self.assertTrue(
+                window.ui_anchor_source_overlay_export_button.isEnabled()
+            )
+            self.assertNotIn(
+                "已导出 UI 锚点源帧覆盖图",
+                window.log_view.toPlainText(),
             )
         finally:
             window.close()
@@ -417,6 +881,20 @@ class MinimalTraceWindowTests(unittest.TestCase):
             self.assertFalse(
                 dialog.ui_anchor_refinement_expansion_radius_spin.isEnabled()
             )
+            self.assertEqual(
+                dialog.ui_anchor_tracking_add_observations_spin.value(),
+                5,
+            )
+            self.assertEqual(
+                dialog.ui_anchor_tracking_remove_observations_spin.value(),
+                13,
+            )
+            self.assertTrue(
+                dialog.ui_anchor_tracking_add_observations_spin.isEnabled()
+            )
+            self.assertTrue(
+                dialog.ui_anchor_tracking_remove_observations_spin.isEnabled()
+            )
 
             dialog._restore_defaults()
 
@@ -479,6 +957,20 @@ class MinimalTraceWindowTests(unittest.TestCase):
             )
             self.assertTrue(
                 dialog.ui_anchor_refinement_expansion_radius_spin.isEnabled()
+            )
+            self.assertEqual(
+                dialog.ui_anchor_tracking_add_observations_spin.value(),
+                2,
+            )
+            self.assertEqual(
+                dialog.ui_anchor_tracking_remove_observations_spin.value(),
+                8,
+            )
+            self.assertTrue(
+                dialog.ui_anchor_tracking_add_observations_spin.isEnabled()
+            )
+            self.assertTrue(
+                dialog.ui_anchor_tracking_remove_observations_spin.isEnabled()
             )
         finally:
             dialog.close()
@@ -545,6 +1037,12 @@ class MinimalTraceWindowTests(unittest.TestCase):
             ),
             "refinement_expansion_radius_px": (
                 "ui_anchor_refinement_expansion_radius_px"
+            ),
+            "tracking_add_observations": (
+                "ui_anchor_tracking_add_observations"
+            ),
+            "tracking_remove_observations": (
+                "ui_anchor_tracking_remove_observations"
             ),
         }
         try:
@@ -633,6 +1131,8 @@ class MinimalTraceWindowTests(unittest.TestCase):
             "ui_anchor_refinement_max_observations",
             "ui_anchor_refinement_no_growth_observations",
             "ui_anchor_refinement_expansion_radius_px",
+            "ui_anchor_tracking_add_observations",
+            "ui_anchor_tracking_remove_observations",
         ):
             with self.subTest(field_name=field_name, invalid_value=True):
                 with self.assertRaises(TypeError):
@@ -645,6 +1145,13 @@ class MinimalTraceWindowTests(unittest.TestCase):
                 defaults,
                 ui_anchor_refinement_max_observations=501,
             )
+        for field_name in (
+            "ui_anchor_tracking_add_observations",
+            "ui_anchor_tracking_remove_observations",
+        ):
+            with self.subTest(field_name=field_name, invalid_value=501):
+                with self.assertRaises(ValueError):
+                    replace(defaults, **{field_name: 501})
         with self.assertRaises(ValueError):
             replace(
                 defaults,
@@ -999,6 +1506,7 @@ class MinimalTraceWindowTests(unittest.TestCase):
             ui_anchor_eligible_observations=42,
             ui_anchor_progress_regions=3,
             ui_anchor_refining_regions=2,
+            ui_anchor_tracking_regions=1,
             ui_anchor_promoted_candidates=0,
             ui_anchor_persisted_candidates=0,
             ui_anchor_last_reason_code="MOTION_SUPPORT_ACCUMULATED",
@@ -1017,7 +1525,7 @@ class MinimalTraceWindowTests(unittest.TestCase):
 
             self.assertEqual(
                 window.metric_labels["ui_anchor_state"].text(),
-                "REFINING · 2 个区域",
+                "TRACKING · 1 个动态掩码",
             )
             progress = window.metric_labels["ui_anchor_progress"].text()
             self.assertIn("37/50", progress)
@@ -1025,6 +1533,7 @@ class MinimalTraceWindowTests(unittest.TestCase):
             self.assertIn("有效运动支持 42", progress)
             self.assertIn("区域 3", progress)
             self.assertIn("精修中 2", progress)
+            self.assertIn("动态 1", progress)
             motion = window.metric_labels["ui_anchor_motion"].text()
             self.assertIn("有效/分析 42/64", motion)
             self.assertIn("运动阶段 3", motion)
@@ -1268,6 +1777,255 @@ class MinimalTraceWindowTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_ui_anchor_masks_run_sequential_sam_and_switch_in_new_tab(
+        self,
+    ) -> None:
+        created_sessions = []
+
+        def sam_factory(**kwargs):
+            session = _FakeUiAnchorSamSession(kwargs["batch"])
+            created_sessions.append(session)
+            return session
+
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+            ui_anchor_sam_preview_factory=sam_factory,
+        )
+        bridge = _FakeKeyframeSession()
+        preview = _sam_ready_ui_anchor_preview(second_target=True)
+        bridge.ui_anchor_previews.put(preview)
+        try:
+            window._drain_ui_anchor_previews(bridge)
+
+            self.assertTrue(window.ui_anchor_sam_preview_button.isEnabled())
+            window._start_ui_anchor_sam_preview()
+
+            self.assertEqual(len(created_sessions), 1)
+            session = created_sessions[0]
+            self.assertTrue(session.started)
+            self.assertEqual(len(session.batch.items), 2)
+            self.assertIs(
+                window.evidence_tabs.currentWidget(),
+                window.ui_anchor_sam_preview_group,
+            )
+            self.assertEqual(window.ui_anchor_sam_result_combo.count(), 2)
+            self.assertTrue(window.ui_anchor_sam_result_combo.isEnabled())
+            self.assertIn(
+                "PENDING",
+                window.ui_anchor_sam_detail_label.text(),
+            )
+
+            session.results.put(
+                _ui_anchor_sam_event(session.batch, 0, succeeded=False)
+            )
+            session.results.put(
+                _ui_anchor_sam_event(session.batch, 1, succeeded=True)
+            )
+            session.is_alive = False
+            window._drain_ui_anchor_sam_previews()
+
+            self.assertIsNone(window._ui_anchor_sam_session)
+            self.assertTrue(window.ui_anchor_sam_preview_button.isEnabled())
+            self.assertIn(
+                "FAILED",
+                window.ui_anchor_sam_result_combo.itemText(0),
+            )
+            self.assertIn(
+                "SUCCEEDED",
+                window.ui_anchor_sam_result_combo.itemText(1),
+            )
+            window.ui_anchor_sam_result_combo.setCurrentIndex(0)
+            self.assertIn("TEST_SAM_FAILURE", window.ui_anchor_sam_detail_label.text())
+            window.ui_anchor_sam_result_combo.setCurrentIndex(1)
+            self.assertIn(
+                "SAM_SEGMENTATION_SUCCEEDED",
+                window.ui_anchor_sam_detail_label.text(),
+            )
+            self.assertIn(
+                "不登记模板、不宣布 UI 状态",
+                window.ui_anchor_sam_detail_label.text(),
+            )
+            self.assertIsNotNone(window._ui_anchor_sam_image)
+        finally:
+            window.close()
+
+    def test_ui_anchor_sam_terminal_check_drains_final_event_after_join(
+        self,
+    ) -> None:
+        created_sessions = []
+
+        class _PublishFinalEventOnAliveCheckSession:
+            def __init__(self, batch) -> None:
+                self.batch = batch
+                self.results = queue.Queue()
+                self.failure = None
+                self.started = False
+                self.stop_requested = False
+                self.joined = False
+                self.alive_checks = 0
+
+            def start(self) -> None:
+                self.started = True
+
+            def is_alive(self) -> bool:
+                self.alive_checks += 1
+                if self.alive_checks == 1:
+                    self.results.put(
+                        _ui_anchor_sam_event(
+                            self.batch,
+                            0,
+                            succeeded=True,
+                        )
+                    )
+                return False
+
+            def request_stop(self) -> None:
+                self.stop_requested = True
+
+            def join(self, timeout=None) -> bool:
+                self.joined = True
+                self.asserted_timeout = timeout
+                return True
+
+        def sam_factory(**kwargs):
+            session = _PublishFinalEventOnAliveCheckSession(kwargs["batch"])
+            created_sessions.append(session)
+            return session
+
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+            ui_anchor_sam_preview_factory=sam_factory,
+        )
+        bridge = _FakeKeyframeSession()
+        bridge.ui_anchor_previews.put(_sam_ready_ui_anchor_preview())
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            window._start_ui_anchor_sam_preview()
+            session = created_sessions[0]
+            self.assertTrue(session.results.empty())
+
+            window._drain_ui_anchor_sam_previews()
+
+            self.assertEqual(session.alive_checks, 1)
+            self.assertTrue(session.joined)
+            self.assertEqual(session.asserted_timeout, 0)
+            self.assertTrue(session.results.empty())
+            self.assertIsNone(window._ui_anchor_sam_session)
+            self.assertIn(
+                "SUCCEEDED",
+                window.ui_anchor_sam_result_combo.itemText(0),
+            )
+            self.assertIn(
+                "SAM_SEGMENTATION_SUCCEEDED",
+                window.ui_anchor_sam_detail_label.text(),
+            )
+            self.assertIn(
+                "逐掩码 SAM 已完成 1/1",
+                window.log_view.toPlainText(),
+            )
+        finally:
+            window.close()
+
+    def test_ui_anchor_sam_waits_for_automatic_hud_sam_capture_to_stop(
+        self,
+    ) -> None:
+        created_sessions = []
+
+        def sam_factory(**kwargs):
+            session = _FakeUiAnchorSamSession(kwargs["batch"])
+            created_sessions.append(session)
+            return session
+
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+            ui_anchor_sam_preview_factory=sam_factory,
+        )
+        bridge = _FakeKeyframeSession()
+        bridge.ui_anchor_previews.put(_sam_ready_ui_anchor_preview())
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            self.assertTrue(window.ui_anchor_sam_preview_button.isEnabled())
+
+            window.icon_record_check.setChecked(True)
+            window._keyframe_session = bridge
+            window._update_ui_anchor_sam_button()
+
+            self.assertFalse(window.ui_anchor_sam_preview_button.isEnabled())
+            window._start_ui_anchor_sam_preview()
+            self.assertEqual(created_sessions, [])
+            self.assertIn(
+                "避免同一设备并发加载两份模型",
+                window.ui_anchor_sam_detail_label.text(),
+            )
+
+            window._keyframe_session = None
+            window._update_ui_anchor_sam_button()
+            self.assertTrue(window.ui_anchor_sam_preview_button.isEnabled())
+        finally:
+            window._keyframe_session = None
+            window.close()
+
+    def test_ui_anchor_sam_click_freezes_frame_and_scope_reset_cancels_batch(
+        self,
+    ) -> None:
+        created_sessions = []
+
+        def sam_factory(**kwargs):
+            session = _FakeUiAnchorSamSession(kwargs["batch"])
+            created_sessions.append(session)
+            return session
+
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+            ui_anchor_sam_preview_factory=sam_factory,
+        )
+        bridge = _FakeKeyframeSession()
+        first = _sam_ready_ui_anchor_preview(frame_number=1)
+        second = _sam_ready_ui_anchor_preview(frame_number=2)
+        bridge.ui_anchor_previews.put(first)
+        try:
+            window._drain_ui_anchor_previews(bridge)
+            window._start_ui_anchor_sam_preview()
+            session = created_sessions[0]
+            frozen_frame_id = session.batch.frame_id
+
+            bridge.ui_anchor_previews.put(second)
+            window._drain_ui_anchor_previews(bridge)
+
+            self.assertEqual(session.batch.frame_id, frozen_frame_id)
+            self.assertEqual(
+                window._ui_anchor_preview_snapshot.frame_id,
+                second.frame_id,
+            )
+            self.assertFalse(window.ui_anchor_sam_preview_button.isEnabled())
+
+            window._activate_ui_anchor_scope("layout-new")
+
+            self.assertTrue(session.stop_requested)
+            self.assertIsNone(window._ui_anchor_sam_batch)
+            self.assertIsNone(window._ui_anchor_preview_snapshot)
+            self.assertEqual(window.ui_anchor_sam_result_combo.count(), 0)
+            self.assertFalse(window.ui_anchor_sam_preview_button.isEnabled())
+            self.assertEqual(
+                window.ui_anchor_sam_preview.text(),
+                "请先在 UI 锚点页生成掩码，再手动启动 SAM",
+            )
+
+            session.results.put(
+                _ui_anchor_sam_event(session.batch, 0, succeeded=True)
+            )
+            window._drain_ui_anchor_sam_previews()
+
+            self.assertIsNone(window._ui_anchor_sam_session)
+            self.assertEqual(window.ui_anchor_sam_result_combo.count(), 0)
+            self.assertIsNone(window._ui_anchor_sam_image)
+        finally:
+            window.close()
+
     def test_ui_anchor_refining_preview_reports_additive_progress(self) -> None:
         window = MinimalTraceWindow(
             backend_probe=lambda: (_wgc_capability(),),
@@ -1302,6 +2060,83 @@ class MinimalTraceWindowTests(unittest.TestCase):
             self.assertIn("新增 37 px", detail)
             self.assertIn("无新增 3/5", detail)
             self.assertIn("固定扩展 4 px", detail)
+        finally:
+            window.close()
+
+    def test_ui_anchor_dynamic_preview_replaces_visible_revision_without_click(
+        self,
+    ) -> None:
+        window = MinimalTraceWindow(
+            backend_probe=lambda: (_wgc_capability(),),
+            window_provider=lambda **_kwargs: [],
+        )
+        bridge = _FakeKeyframeSession()
+
+        def dynamic_preview(
+            *,
+            revision: int,
+            active_pixels: int,
+            added_pixels: int,
+            removed_pixels: int,
+            color: int,
+        ) -> SimpleNamespace:
+            region = SimpleNamespace(
+                candidate_id="ui-anchor-000001",
+                revision=revision,
+                observations=20 + revision,
+                active_pixels=active_pixels,
+                added_pixels=added_pixels,
+                removed_pixels=removed_pixels,
+                add_observation_target=2,
+                remove_observation_target=8,
+            )
+            return SimpleNamespace(
+                frame_id=f"dynamic-{revision}",
+                scope_id="layout-a",
+                rgb_pixels=np.full((180, 320, 3), color, dtype=np.uint8),
+                analysis=SimpleNamespace(
+                    progress_regions=(),
+                    refinement_regions=(),
+                    tracking_regions=(region,),
+                ),
+            )
+
+        try:
+            bridge.ui_anchor_previews.put(
+                dynamic_preview(
+                    revision=2,
+                    active_pixels=120,
+                    added_pixels=8,
+                    removed_pixels=0,
+                    color=40,
+                )
+            )
+            window._drain_ui_anchor_previews(bridge)
+            self.assertIn("r2", window.ui_anchor_detail_label.text())
+            self.assertIn("最近 +8/-0 px", window.ui_anchor_detail_label.text())
+
+            bridge.ui_anchor_previews.put(
+                dynamic_preview(
+                    revision=3,
+                    active_pixels=105,
+                    added_pixels=0,
+                    removed_pixels=15,
+                    color=80,
+                )
+            )
+            window._drain_ui_anchor_previews(bridge)
+
+            detail = window.ui_anchor_detail_label.text()
+            self.assertIn("动态掩码 1 个", detail)
+            self.assertIn("ui-anchor-000001 [TRACKING]", detail)
+            self.assertIn("r3", detail)
+            self.assertIn("当前 105 px", detail)
+            self.assertIn("最近 +0/-15 px", detail)
+            self.assertIn("加入/移除确认 2/8", detail)
+            self.assertEqual(
+                window._ui_anchor_image.pixelColor(10, 10).getRgb()[:3],
+                (80, 80, 80),
+            )
         finally:
             window.close()
 

@@ -75,6 +75,7 @@ class UiAnchorProgressStage(str, Enum):
     GEOMETRY = "GEOMETRY"
     READY = "READY"
     REFINING = "REFINING"
+    TRACKING = "TRACKING"
     EMITTED = "EMITTED"
     LIMIT_REACHED = "LIMIT_REACHED"
 
@@ -89,6 +90,7 @@ class UiAnchorProgressBlockingReason(str, Enum):
     CORE_BBOX_AREA_EXCEEDS_LIMIT = "CORE_BBOX_AREA_EXCEEDS_LIMIT"
     READY_FOR_PROMOTION_CHECK = "READY_FOR_PROMOTION_CHECK"
     REFINEMENT_PENDING = "REFINEMENT_PENDING"
+    DYNAMIC_MASK_TRACKING = "DYNAMIC_MASK_TRACKING"
     ALREADY_EMITTED = "ALREADY_EMITTED"
     SESSION_CANDIDATE_LIMIT_REACHED = "SESSION_CANDIDATE_LIMIT_REACHED"
 
@@ -139,6 +141,8 @@ class UiAnchorDiscoveryPolicy:
     refinement_max_observations: int = 20
     refinement_no_growth_observations: int = 5
     refinement_expansion_radius_px: int = 4
+    tracking_add_observations: int = 2
+    tracking_remove_observations: int = 8
 
     _MAX_ANALYSIS_PIXELS = 320 * 180
     _MAX_SUPPORT_TARGET = 10_000
@@ -146,6 +150,7 @@ class UiAnchorDiscoveryPolicy:
     _MAX_EVIDENCE_GAP_MS = 3_600_000
     _MAX_REFINEMENT_OBSERVATIONS = 500
     _MAX_REFINEMENT_EXPANSION_RADIUS_PX = 16
+    _MAX_TRACKING_OBSERVATIONS = 500
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -177,6 +182,8 @@ class UiAnchorDiscoveryPolicy:
             "refinement_max_observations",
             "refinement_no_growth_observations",
             "refinement_expansion_radius_px",
+            "tracking_add_observations",
+            "tracking_remove_observations",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -208,6 +215,8 @@ class UiAnchorDiscoveryPolicy:
             "refinement_max_observations",
             "refinement_no_growth_observations",
             "refinement_expansion_radius_px",
+            "tracking_add_observations",
+            "tracking_remove_observations",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -259,6 +268,12 @@ class UiAnchorDiscoveryPolicy:
             raise ValueError(
                 "refinement_expansion_radius_px cannot exceed 16"
             )
+        for name in (
+            "tracking_add_observations",
+            "tracking_remove_observations",
+        ):
+            if getattr(self, name) > self._MAX_TRACKING_OBSERVATIONS:
+                raise ValueError(f"{name} cannot exceed 500")
         grid_cells = self.motion_grid_columns * self.motion_grid_rows
         if grid_cells > 64:
             raise ValueError("motion grid cannot exceed 64 cells")
@@ -504,6 +519,80 @@ class UiAnchorRefinementRegion:
         return int(np.count_nonzero(self.added_mask))
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class UiAnchorTrackingRegion:
+    """One confirmed candidate whose current mask keeps changing in memory."""
+
+    candidate_id: str
+    bbox_canvas: Box
+    base_mask: MaskPixels
+    active_mask: MaskPixels
+    added_mask: MaskPixels
+    removed_mask: MaskPixels
+    revision: int
+    observations: int
+    add_observation_target: int
+    remove_observation_target: int
+
+    def __post_init__(self) -> None:
+        if not self.candidate_id:
+            raise ValueError("candidate_id cannot be empty")
+        x1, y1, x2, y2 = self.bbox_canvas
+        if not (0 <= x1 < x2 and 0 <= y1 < y2):
+            raise ValueError("bbox_canvas must be a non-empty box")
+        expected_shape = (y2 - y1, x2 - x1)
+        base = _immutable_bool(self.base_mask)
+        active = _immutable_bool(self.active_mask)
+        added = _immutable_bool(self.added_mask)
+        removed = _immutable_bool(self.removed_mask)
+        for name, mask in (
+            ("base_mask", base),
+            ("active_mask", active),
+            ("added_mask", added),
+            ("removed_mask", removed),
+        ):
+            if mask.shape != expected_shape:
+                raise ValueError(f"{name} must be cropped to bbox_canvas")
+        if not np.any(base):
+            raise ValueError("base_mask cannot be empty")
+        if np.any(added & ~active):
+            raise ValueError("added_mask must be a subset of active_mask")
+        if np.any(removed & active):
+            raise ValueError("removed_mask cannot overlap active_mask")
+        if np.any(added & removed):
+            raise ValueError("added_mask and removed_mask cannot overlap")
+        for name in (
+            "revision",
+            "add_observation_target",
+            "remove_observation_target",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.observations, bool)
+            or not isinstance(self.observations, int)
+            or self.observations < 0
+        ):
+            raise ValueError("observations cannot be negative")
+        object.__setattr__(self, "base_mask", base)
+        object.__setattr__(self, "active_mask", active)
+        object.__setattr__(self, "added_mask", added)
+        object.__setattr__(self, "removed_mask", removed)
+
+    @property
+    def active_pixels(self) -> int:
+        return int(np.count_nonzero(self.active_mask))
+
+    @property
+    def added_pixels(self) -> int:
+        return int(np.count_nonzero(self.added_mask))
+
+    @property
+    def removed_pixels(self) -> int:
+        return int(np.count_nonzero(self.removed_mask))
+
+
 @dataclass(frozen=True, slots=True)
 class _ProgressRegionObservation:
     evidence_bbox_canvas: Box
@@ -550,6 +639,22 @@ class _RefinementTrack:
     evidence: _CandidateEvidence
     observations: int = 0
     no_growth_observations: int = 0
+
+
+@dataclass(slots=True)
+class _TrackingTrack:
+    candidate_id: str
+    scope_id: str
+    bbox_canvas: Box
+    base_mask: MaskPixels
+    active_mask: MaskPixels
+    growth_zone_mask: MaskPixels
+    add_streak: NDArray[np.uint16]
+    remove_streak: NDArray[np.uint16]
+    added_mask: MaskPixels
+    removed_mask: MaskPixels
+    revision: int = 1
+    observations: int = 0
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -658,13 +763,14 @@ class UiAnchorAnalysis:
     maximum_translucent_support: int = 0
     progress_regions: tuple[UiAnchorProgressRegion, ...] = ()
     refinement_regions: tuple[UiAnchorRefinementRegion, ...] = ()
+    tracking_regions: tuple[UiAnchorTrackingRegion, ...] = ()
     candidates: tuple[UiAnchorCandidate, ...] = ()
 
 
 class ScreenLockedRegionAccumulator:
     """Accumulate salient screen-fixed evidence only during world motion."""
 
-    ALGORITHM_REVISION = 3
+    ALGORITHM_REVISION = 4
     _MAX_FLOW_CORNERS = 500
     _FLOW_FB_ERROR_PX = 1.5
     _MAX_PROGRESS_REGIONS = 8
@@ -689,9 +795,8 @@ class ScreenLockedRegionAccumulator:
         self._translucent_direction_bits_map = np.zeros(shape, dtype=np.uint16)
         self._episode_vote_map = np.zeros(shape, dtype=np.bool_)
         self._translucent_episode_vote_map = np.zeros(shape, dtype=np.bool_)
-        self._emitted_mask = np.zeros(shape, dtype=np.bool_)
+        self._tracking_mask = np.zeros(shape, dtype=np.bool_)
         self._refining_mask = np.zeros(shape, dtype=np.bool_)
-        self._emitted_masks_by_scope: dict[str, MaskPixels] = {}
         self._previous_gray: GrayPixels | None = None
         self._previous_content_mask: MaskPixels | None = None
         self._last_sample_ns: int | None = None
@@ -708,6 +813,8 @@ class ScreenLockedRegionAccumulator:
         self._progress_tracks: dict[str, _ProgressRegionTrack] = {}
         self._progress_region_sequence = 0
         self._refinement_tracks: dict[str, _RefinementTrack] = {}
+        self._tracking_tracks: dict[str, _TrackingTrack] = {}
+        self._tracking_changed_in_last_promotion = False
 
     @property
     def retained_bytes(self) -> int:
@@ -729,6 +836,7 @@ class ScreenLockedRegionAccumulator:
             self._previous_gray,
             self._previous_content_mask,
             self._refining_mask,
+            self._tracking_mask,
         )
         retained = sum(array.nbytes for array in arrays if array is not None)
         refinement_arrays = {
@@ -740,31 +848,30 @@ class ScreenLockedRegionAccumulator:
                 track.growth_zone_mask,
             )
         }
-        emitted_masks = {
-            id(mask): mask
-            for mask in (
-                self._emitted_mask,
-                *self._emitted_masks_by_scope.values(),
+        tracking_arrays = {
+            id(array): array
+            for track in self._tracking_tracks.values()
+            for array in (
+                track.base_mask,
+                track.active_mask,
+                track.growth_zone_mask,
+                track.add_streak,
+                track.remove_streak,
+                track.added_mask,
+                track.removed_mask,
             )
         }
         return (
             retained
-            + sum(mask.nbytes for mask in emitted_masks.values())
             + sum(mask.nbytes for mask in refinement_arrays.values())
+            + sum(array.nbytes for array in tracking_arrays.values())
         )
 
     def reset(self, scope_id: str | None = None) -> None:
-        if self._scope_id is not None and np.any(self._emitted_mask):
-            self._emitted_masks_by_scope[self._scope_id] = self._emitted_mask
-        self._reset_support_evidence(preserve_emitted=True)
-        shape = (self.policy.analysis_height, self.policy.analysis_width)
-        self._emitted_mask = self._emitted_masks_by_scope.get(
-            scope_id,
-            np.zeros(shape, dtype=np.bool_),
-        )
+        self._reset_support_evidence(preserve_tracking=False)
         self._scope_id = scope_id
 
-    def _reset_support_evidence(self, *, preserve_emitted: bool) -> None:
+    def _reset_support_evidence(self, *, preserve_tracking: bool) -> None:
         self._support_map.fill(0)
         self._eligible_map.fill(0)
         self._translucent_support_map.fill(0)
@@ -792,8 +899,16 @@ class ScreenLockedRegionAccumulator:
         self._progress_tracks.clear()
         self._progress_region_sequence = 0
         self._refinement_sequence = 0
-        if not preserve_emitted:
-            self._emitted_mask.fill(False)
+        self._tracking_changed_in_last_promotion = False
+        if preserve_tracking:
+            for track in self._tracking_tracks.values():
+                track.add_streak.fill(0)
+                track.remove_streak.fill(0)
+                track.added_mask.fill(False)
+                track.removed_mask.fill(False)
+        else:
+            self._tracking_mask.fill(False)
+            self._tracking_tracks.clear()
 
     def observe(
         self,
@@ -834,7 +949,7 @@ class ScreenLockedRegionAccumulator:
             )
         gap_ns = captured_at_monotonic_ns - self._last_sample_ns
         if gap_ns > self.policy.maximum_evidence_gap_ms * 1_000_000:
-            self._reset_support_evidence(preserve_emitted=True)
+            self._reset_support_evidence(preserve_tracking=True)
             analysis = self._analysis(
                 frame_id,
                 scope_id,
@@ -939,6 +1054,14 @@ class ScreenLockedRegionAccumulator:
                 translucent_orientation_x=translucent_orientation_x,
                 translucent_orientation_y=translucent_orientation_y,
             )
+            tracking_positive = np.ascontiguousarray(
+                vote | translucent_vote,
+                dtype=np.bool_,
+            )
+            tracking_eligible = np.ascontiguousarray(
+                changed_mask & (eligible | translucent_eligible),
+                dtype=np.bool_,
+            )
             refinements_before = len(self._refinement_tracks)
             candidates = self._promote_candidates(
                 rgb,
@@ -947,13 +1070,19 @@ class ScreenLockedRegionAccumulator:
                 scope_id,
                 captured_at_monotonic_ns,
                 source_frame_metadata,
+                tracking_positive=tracking_positive,
+                tracking_eligible=tracking_eligible,
             )
             if candidates:
                 reason_code = "CANDIDATE_PROMOTED"
+            elif self._tracking_changed_in_last_promotion:
+                reason_code = "DYNAMIC_MASK_UPDATED"
             elif len(self._refinement_tracks) > refinements_before:
                 reason_code = "REFINEMENT_STARTED"
             elif self._refinement_tracks:
                 reason_code = "REFINEMENT_ACCUMULATING"
+            elif self._tracking_tracks:
+                reason_code = "DYNAMIC_MASK_TRACKING"
             else:
                 reason_code = "MOTION_SUPPORT_ACCUMULATED"
         else:
@@ -1208,6 +1337,9 @@ class ScreenLockedRegionAccumulator:
         scope_id: str,
         captured_at_monotonic_ns: int,
         source_frame_metadata: Mapping[str, object],
+        *,
+        tracking_positive: MaskPixels | None = None,
+        tracking_eligible: MaskPixels | None = None,
     ) -> tuple[UiAnchorCandidate, ...]:
         policy = self.policy
         safe_eligible = np.maximum(self._eligible_map, 1)
@@ -1315,6 +1447,23 @@ class ScreenLockedRegionAccumulator:
             np.ones((7, 7), dtype=np.uint8),
         ).astype(bool)
         refinement_core = opaque_refinement_core | translucent_refinement_core
+        if (tracking_positive is None) != (tracking_eligible is None):
+            raise ValueError(
+                "tracking_positive and tracking_eligible must be provided together"
+            )
+        if tracking_positive is None:
+            resolved_tracking_positive = refinement_core
+            resolved_tracking_eligible = refinement_core
+        else:
+            resolved_tracking_positive = self._validate_mask(tracking_positive)
+            resolved_tracking_eligible = self._validate_mask(tracking_eligible)
+        self._tracking_changed_in_last_promotion = (
+            self._advance_tracking_tracks(
+                resolved_tracking_positive,
+                resolved_tracking_eligible,
+                scope_id,
+            )
+        )
 
         output = list(
             self._advance_refinement_tracks(
@@ -1335,7 +1484,7 @@ class ScreenLockedRegionAccumulator:
 
         seed = (
             (opaque_seed | translucent_seed)
-            & ~self._emitted_mask
+            & ~self._tracking_mask
             & ~self._refining_mask
         )
         if not np.any(seed):
@@ -1353,7 +1502,7 @@ class ScreenLockedRegionAccumulator:
             component = labels == label
             if not np.any(component & seed):
                 continue
-            if np.any(component & (self._emitted_mask | self._refining_mask)):
+            if np.any(component & (self._tracking_mask | self._refining_mask)):
                 continue
             area = int(stats[label, cv2.CC_STAT_AREA])
             if area < policy.minimum_core_pixels:
@@ -1455,7 +1604,11 @@ class ScreenLockedRegionAccumulator:
                 source_frame_metadata,
             )
             output.append(candidate)
-            self._mark_emitted(component)
+            self._start_tracking_track_from_canvas(
+                candidate,
+                component,
+                scope_id,
+            )
         return tuple(output)
 
     def _start_refinement_track(
@@ -1486,7 +1639,7 @@ class ScreenLockedRegionAccumulator:
             kernel,
         ).astype(bool)
         claimed = (
-            self._emitted_mask[y1:y2, x1:x2]
+            self._tracking_mask[y1:y2, x1:x2]
             | self._refining_mask[y1:y2, x1:x2]
         )
         growth_zone &= ~claimed
@@ -1580,7 +1733,12 @@ class ScreenLockedRegionAccumulator:
                 source_frame_metadata,
             )
             output.append(candidate)
-            self._mark_emitted(mask_canvas)
+            self._start_tracking_track(
+                candidate,
+                bbox_canvas=track.bbox_canvas,
+                base_mask=track.seed_mask | track.added_mask,
+                growth_zone_mask=track.growth_zone_mask,
+            )
             completed_ids.append(refinement_id)
         for refinement_id in completed_ids:
             del self._refinement_tracks[refinement_id]
@@ -1648,12 +1806,160 @@ class ScreenLockedRegionAccumulator:
             policy=policy,
         )
 
-    def _mark_emitted(self, mask_canvas: MaskPixels) -> None:
-        expanded = cv2.dilate(
-            mask_canvas.astype(np.uint8),
-            np.ones((5, 5), dtype=np.uint8),
+    def _start_tracking_track_from_canvas(
+        self,
+        candidate: UiAnchorCandidate,
+        base_canvas: MaskPixels,
+        scope_id: str,
+    ) -> None:
+        if candidate.scope_id != scope_id:
+            raise ValueError("candidate scope does not match tracking scope")
+        seed_y, seed_x = np.nonzero(base_canvas)
+        if not len(seed_x):
+            raise ValueError("tracking base mask cannot be empty")
+        radius = self.policy.refinement_expansion_radius_px
+        x1 = max(0, int(np.min(seed_x)) - radius)
+        y1 = max(0, int(np.min(seed_y)) - radius)
+        x2 = min(
+            self.policy.analysis_width,
+            int(np.max(seed_x)) + radius + 1,
+        )
+        y2 = min(
+            self.policy.analysis_height,
+            int(np.max(seed_y)) + radius + 1,
+        )
+        base = np.ascontiguousarray(
+            base_canvas[y1:y2, x1:x2],
+            dtype=np.bool_,
+        )
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * radius + 1, 2 * radius + 1),
+        )
+        growth_zone = cv2.dilate(
+            base.astype(np.uint8),
+            kernel,
         ).astype(bool)
-        self._emitted_mask |= expanded
+        claimed = self._tracking_mask[y1:y2, x1:x2]
+        growth_zone &= ~claimed
+        growth_zone |= base
+        self._start_tracking_track(
+            candidate,
+            bbox_canvas=(x1, y1, x2, y2),
+            base_mask=base,
+            growth_zone_mask=growth_zone,
+        )
+
+    def _start_tracking_track(
+        self,
+        candidate: UiAnchorCandidate,
+        *,
+        bbox_canvas: Box,
+        base_mask: MaskPixels,
+        growth_zone_mask: MaskPixels,
+    ) -> None:
+        if candidate.candidate_id in self._tracking_tracks:
+            raise ValueError("candidate already has a dynamic tracking region")
+        x1, y1, x2, y2 = bbox_canvas
+        expected = (y2 - y1, x2 - x1)
+        base = np.ascontiguousarray(base_mask, dtype=np.bool_)
+        growth_zone = np.ascontiguousarray(
+            growth_zone_mask,
+            dtype=np.bool_,
+        )
+        if base.shape != expected or growth_zone.shape != expected:
+            raise ValueError("tracking masks must match bbox_canvas")
+        if not np.any(base) or np.any(base & ~growth_zone):
+            raise ValueError("tracking base must lie inside its growth zone")
+        self._tracking_tracks[candidate.candidate_id] = _TrackingTrack(
+            candidate_id=candidate.candidate_id,
+            scope_id=candidate.scope_id,
+            bbox_canvas=bbox_canvas,
+            base_mask=base.copy(),
+            active_mask=base.copy(),
+            growth_zone_mask=growth_zone.copy(),
+            add_streak=np.zeros(expected, dtype=np.uint16),
+            remove_streak=np.zeros(expected, dtype=np.uint16),
+            added_mask=np.zeros(expected, dtype=np.bool_),
+            removed_mask=np.zeros(expected, dtype=np.bool_),
+        )
+        self._tracking_mask[y1:y2, x1:x2] |= growth_zone
+
+    def _advance_tracking_tracks(
+        self,
+        positive_canvas: MaskPixels,
+        eligible_canvas: MaskPixels,
+        scope_id: str,
+    ) -> bool:
+        if not self._tracking_tracks:
+            return False
+        changed_any = False
+        policy = self.policy
+        for track in self._tracking_tracks.values():
+            if track.scope_id != scope_id:
+                continue
+            x1, y1, x2, y2 = track.bbox_canvas
+            positive = (
+                positive_canvas[y1:y2, x1:x2]
+                & track.growth_zone_mask
+            )
+            eligible = (
+                eligible_canvas[y1:y2, x1:x2]
+                & track.growth_zone_mask
+            )
+            track.observations += 1
+
+            add_vote = positive & ~track.active_mask
+            track.add_streak[~add_vote] = 0
+            self._increment_uint16(track.add_streak, add_vote)
+            additions_ready = (
+                track.add_streak >= policy.tracking_add_observations
+            )
+            connected = self._retain_seeded_components(
+                track.base_mask | track.active_mask | additions_ready,
+                track.base_mask,
+            )
+            additions = connected & additions_ready & ~track.active_mask
+
+            reliable_negative = (
+                eligible & ~positive & track.active_mask
+            )
+            track.remove_streak[~reliable_negative] = 0
+            self._increment_uint16(
+                track.remove_streak,
+                reliable_negative,
+            )
+            removals = (
+                track.active_mask
+                & (
+                    track.remove_streak
+                    >= policy.tracking_remove_observations
+                )
+            )
+
+            next_active = (track.active_mask | additions) & ~removals
+            changed = bool(np.any(additions) or np.any(removals))
+            if changed:
+                track.active_mask = np.ascontiguousarray(
+                    next_active,
+                    dtype=np.bool_,
+                )
+                track.added_mask = np.ascontiguousarray(
+                    additions,
+                    dtype=np.bool_,
+                )
+                track.removed_mask = np.ascontiguousarray(
+                    removals,
+                    dtype=np.bool_,
+                )
+                track.add_streak[additions] = 0
+                track.remove_streak[removals] = 0
+                track.revision += 1
+                changed_any = True
+            else:
+                track.added_mask.fill(False)
+                track.removed_mask.fill(False)
+        return changed_any
 
     def _rebuild_refining_mask(self) -> None:
         self._refining_mask.fill(False)
@@ -1995,6 +2301,24 @@ class ScreenLockedRegionAccumulator:
             for track in self._refinement_tracks.values()
         )
 
+    def _tracking_regions(self) -> tuple[UiAnchorTrackingRegion, ...]:
+        policy = self.policy
+        return tuple(
+            UiAnchorTrackingRegion(
+                candidate_id=track.candidate_id,
+                bbox_canvas=track.bbox_canvas,
+                base_mask=track.base_mask,
+                active_mask=track.active_mask,
+                added_mask=track.added_mask,
+                removed_mask=track.removed_mask,
+                revision=track.revision,
+                observations=track.observations,
+                add_observation_target=policy.tracking_add_observations,
+                remove_observation_target=policy.tracking_remove_observations,
+            )
+            for track in self._tracking_tracks.values()
+        )
+
     def _component_progress_evidence(
         self,
         component: MaskPixels,
@@ -2100,9 +2424,9 @@ class ScreenLockedRegionAccumulator:
         direction_diversity = int(direction_counts[selected_y, selected_x])
         completion = float(completion_values[int(order[-1])])
 
-        if np.any(component & self._emitted_mask):
-            stage = UiAnchorProgressStage.EMITTED
-            reason = UiAnchorProgressBlockingReason.ALREADY_EMITTED
+        if np.any(component & self._tracking_mask):
+            stage = UiAnchorProgressStage.TRACKING
+            reason = UiAnchorProgressBlockingReason.DYNAMIC_MASK_TRACKING
         elif np.any(component & self._refining_mask):
             stage = UiAnchorProgressStage.REFINING
             reason = UiAnchorProgressBlockingReason.REFINEMENT_PENDING
@@ -2343,6 +2667,7 @@ class ScreenLockedRegionAccumulator:
             ),
             progress_regions=self._progress_regions(),
             refinement_regions=self._refinement_regions(),
+            tracking_regions=self._tracking_regions(),
             candidates=candidates,
         )
 
@@ -2635,4 +2960,5 @@ __all__ = [
     "UiAnchorProgressRegion",
     "UiAnchorProgressStage",
     "UiAnchorRefinementRegion",
+    "UiAnchorTrackingRegion",
 ]

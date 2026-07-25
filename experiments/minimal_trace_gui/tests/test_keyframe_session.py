@@ -524,6 +524,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
             support_target=50,
             progress_regions=7,
             refining_regions=4,
+            tracking_regions=2,
             promoted_candidates=6,
             persisted_candidates=5,
             last_reason_code="MOTION_OBSERVATION_ACCUMULATED",
@@ -556,6 +557,7 @@ class KeyframeDetectionSessionTests(unittest.TestCase):
         self.assertEqual(stats.ui_anchor_support_target, 50)
         self.assertEqual(stats.ui_anchor_progress_regions, 7)
         self.assertEqual(stats.ui_anchor_refining_regions, 4)
+        self.assertEqual(stats.ui_anchor_tracking_regions, 2)
         self.assertEqual(stats.ui_anchor_promoted_candidates, 6)
         self.assertEqual(stats.ui_anchor_persisted_candidates, 5)
         self.assertEqual(

@@ -345,7 +345,7 @@ class UiAnchorCandidateStore:
             },
             "source_frame": dict(candidate.source_frame_metadata),
             "discovery": {
-                "algorithm": "screen-locked-motion-vote-anchor.v3",
+                "algorithm": "screen-locked-motion-vote-anchor.v4",
                 "policy": asdict(candidate.policy),
             },
             "storage": {
@@ -358,7 +358,8 @@ class UiAnchorCandidateStore:
                 "not_an_actionable_control",
                 "reference_is_an_analysis_canvas_crop",
                 "stable_mask_may_merge_opaque_and_translucent_shape_evidence",
-                "stable_mask_may_include_bounded_post_promotion_growth",
+                "stable_mask_is_initial_dynamic_tracking_baseline",
+                "dynamic_tracking_revisions_are_memory_only",
                 "volatile_mask_is_not_persisted",
             ],
         }

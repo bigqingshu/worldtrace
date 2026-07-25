@@ -250,10 +250,12 @@ class SegmentationQaTests(unittest.TestCase):
 class _FakeExecutor:
     def __init__(self) -> None:
         self.calls = []
+        self.reserve_count = 0
         self.interrupt_count = 0
         self.close_count = 0
 
     def reserve_execution(self) -> int:
+        self.reserve_count += 1
         return 0
 
     def execute(self, configuration, **kwargs):
@@ -369,6 +371,47 @@ class SamProviderTests(unittest.TestCase):
         self.assertEqual(pool.lease_count, 0)
         self.assertTrue(pool.closed)
         self.assertEqual(executor.close_count, 1)
+
+    def test_permanent_cancel_rejects_future_work_until_close_releases_pool(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executor = _FakeExecutor()
+            pool = _CountingPool()
+            provider = SamIconSegmentationProvider(
+                root,
+                device=IconSegmentationDevice.GPU2,
+                registry=build_default_registry(root),
+                executor=executor,
+                shared_frame_pool=pool,
+                verify_assets=False,
+            )
+            request = build_icon_segmentation_request(
+                _candidate(),
+                request_id="request-after-permanent-cancel",
+                submitted_at_monotonic_ns=11,
+            )
+
+            provider.cancel_permanently()
+            provider.cancel_permanently()
+            result = provider.segment(request)
+
+            self.assertEqual(result.status, IconSegmentationStatus.CANCELLED)
+            self.assertEqual(result.reason_code, "PROVIDER_CLOSED")
+            self.assertEqual(executor.reserve_count, 0)
+            self.assertEqual(executor.calls, [])
+            self.assertEqual(executor.interrupt_count, 1)
+            self.assertFalse(pool.closed)
+            self.assertEqual(pool.close_count, 0)
+
+            provider.close()
+            provider.close()
+
+        self.assertEqual(executor.close_count, 1)
+        self.assertEqual(pool.close_count, 1)
+        self.assertTrue(pool.closed)
+        self.assertEqual(pool.lease_count, 0)
 
 
 class _FakeProvider:

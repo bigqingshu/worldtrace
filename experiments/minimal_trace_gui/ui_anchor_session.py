@@ -65,6 +65,8 @@ class UiAnchorPreview:
     scope_id: str
     rgb_pixels: RgbPixels
     analysis: UiAnchorAnalysis
+    canvas_rgb_pixels: RgbPixels | None = None
+    source_frame: FramePacket | None = None
 
     def __post_init__(self) -> None:
         pixels = np.ascontiguousarray(
@@ -74,6 +76,23 @@ class UiAnchorPreview:
             raise ValueError("preview RGB pixels must have shape [height,width,3]")
         pixels.setflags(write=False)
         object.__setattr__(self, "rgb_pixels", pixels)
+        canvas = self.canvas_rgb_pixels
+        if canvas is not None:
+            canvas_pixels = np.ascontiguousarray(
+                np.asarray(canvas, dtype=np.uint8).copy()
+            )
+            if canvas_pixels.shape != pixels.shape:
+                raise ValueError(
+                    "raw canvas RGB pixels must match the preview dimensions"
+                )
+            canvas_pixels.setflags(write=False)
+            object.__setattr__(self, "canvas_rgb_pixels", canvas_pixels)
+        source_frame = self.source_frame
+        if source_frame is not None:
+            if not isinstance(source_frame, FramePacket):
+                raise TypeError("source_frame must be a FramePacket or None")
+            if source_frame.frame_id != self.frame_id:
+                raise ValueError("source_frame identity must match the preview")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +116,7 @@ class UiAnchorSessionStats:
     support_target: int = 50
     progress_regions: int = 0
     refining_regions: int = 0
+    tracking_regions: int = 0
     promoted_candidates: int = 0
     persisted_candidates: int = 0
     errors: int = 0
@@ -202,6 +222,9 @@ class UiAnchorDiscoverySession:
                 ),
                 refining_regions=(
                     0 if analysis is None else len(analysis.refinement_regions)
+                ),
+                tracking_regions=(
+                    0 if analysis is None else len(analysis.tracking_regions)
                 ),
                 promoted_candidates=self._promoted_candidates,
                 persisted_candidates=self._persisted_candidates,
@@ -380,6 +403,8 @@ class UiAnchorDiscoverySession:
                 scope_id=scope_id,
                 rgb_pixels=self._draw_preview(rgb, analysis),
                 analysis=analysis,
+                canvas_rgb_pixels=rgb,
+                source_frame=frame,
             ),
         )
         with self._lock:
@@ -452,7 +477,14 @@ class UiAnchorDiscoverySession:
         analysis: UiAnchorAnalysis,
     ) -> RgbPixels:
         preview = np.ascontiguousarray(rgb.copy(), dtype=np.uint8)
-        if analysis.refinement_regions:
+        if analysis.tracking_regions:
+            if analysis.motion_qualified:
+                state_text = "TRACKING/DYNAMIC"
+                state_color = (96, 255, 224)
+            else:
+                state_text = "TRACKING/WAIT_MOTION"
+                state_color = (255, 208, 96)
+        elif analysis.refinement_regions:
             state_text = "REFINING/ADDING"
             state_color = (255, 128, 224)
         elif analysis.motion_qualified:
@@ -473,7 +505,8 @@ class UiAnchorDiscoverySession:
                 f"{state_text} O{analysis.maximum_opaque_support}/"
                 f"T{analysis.maximum_translucent_support}/"
                 f"{analysis.support_target} R{len(analysis.progress_regions)} "
-                f"F{len(analysis.refinement_regions)}"
+                f"F{len(analysis.refinement_regions)} "
+                f"D{len(analysis.tracking_regions)}"
             ),
             (5, 10),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -614,6 +647,54 @@ class UiAnchorDiscoverySession:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.30,
                 (80, 255, 96),
+                1,
+                cv2.LINE_AA,
+            )
+        for region in analysis.tracking_regions:
+            x1, y1, x2, y2 = region.bbox_canvas
+            expected_shape = (y2 - y1, x2 - x1)
+            active_mask = np.asarray(region.active_mask, dtype=np.bool_)
+            added_mask = np.asarray(region.added_mask, dtype=np.bool_)
+            removed_mask = np.asarray(region.removed_mask, dtype=np.bool_)
+            if (
+                active_mask.shape == expected_shape
+                and added_mask.shape == expected_shape
+                and removed_mask.shape == expected_shape
+            ):
+                crop = preview[y1:y2, x1:x2]
+                active_without_delta = active_mask & ~added_mask
+                for mask, color, opacity in (
+                    (active_without_delta, (80, 232, 184), 0.34),
+                    (added_mask, (255, 96, 224), 0.62),
+                    (removed_mask, (255, 112, 72), 0.68),
+                ):
+                    if not np.any(mask):
+                        continue
+                    original = crop[mask].astype(np.float32)
+                    highlight = np.asarray(color, dtype=np.float32)
+                    crop[mask] = np.clip(
+                        original * (1.0 - opacity) + highlight * opacity,
+                        0,
+                        255,
+                    ).astype(np.uint8)
+            cv2.rectangle(
+                preview,
+                (x1, y1),
+                (x2 - 1, y2 - 1),
+                (80, 232, 184),
+                1,
+            )
+            cv2.putText(
+                preview,
+                (
+                    f"{region.candidate_id} TRACK r{region.revision} "
+                    f"{region.active_pixels}px "
+                    f"+{region.added_pixels}/-{region.removed_pixels}"
+                ),
+                (x1, min(preview.shape[0] - 3, y2 + 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.28,
+                (96, 255, 224),
                 1,
                 cv2.LINE_AA,
             )

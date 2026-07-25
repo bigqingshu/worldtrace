@@ -701,6 +701,7 @@ class SamIconSegmentationProvider:
         self._interrupt_generation = 0
         self._active = False
         self._closed = False
+        self._resources_closed = False
 
     def segment(
         self,
@@ -941,12 +942,28 @@ class SamIconSegmentationProvider:
             self._interrupt_generation += 1
         self.executor.interrupt()
 
-    def close(self) -> None:
+    def cancel_permanently(self) -> None:
+        """Reject future requests and interrupt the active execution.
+
+        Unlike ``close()``, this does not close the shared-frame pool while an
+        active ``segment()`` call may still need to release its descriptor.
+        The owning worker must call ``close()`` after ``segment()`` returns.
+        """
+
         with self._state_lock:
             if self._closed:
                 return
             self._closed = True
             self._interrupt_generation += 1
+        self.executor.interrupt()
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._resources_closed:
+                return
+            self._closed = True
+            self._interrupt_generation += 1
+            self._resources_closed = True
         try:
             self.executor.close()
         finally:

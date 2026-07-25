@@ -95,6 +95,18 @@ from .ui_anchor_discovery import (
 from .ui_anchor_session import (
     UiAnchorDiscoverySession,
     UiAnchorEventStatus,
+    UiAnchorPreview,
+)
+from .ui_anchor_source_overlay import (
+    build_ui_anchor_source_overlay,
+    ui_anchor_source_overlay_mask_count,
+)
+from .ui_anchor_sam_preview import (
+    UiAnchorSamPreviewBatch,
+    UiAnchorSamPreviewSession,
+    build_ui_anchor_sam_preview_batch,
+    render_ui_anchor_sam_prompt,
+    ui_anchor_sam_target_count,
 )
 from .ui_anchor_store import UiAnchorCandidateStore, UiAnchorStorePolicy
 
@@ -126,6 +138,10 @@ def _default_ui_anchor_session_factory(**kwargs):
     return UiAnchorDiscoverySession(**kwargs)
 
 
+def _default_ui_anchor_sam_preview_factory(**kwargs):
+    return UiAnchorSamPreviewSession(**kwargs)
+
+
 def _default_ui_anchor_export_path_provider(
     parent: QWidget,
     default_path: Path,
@@ -133,6 +149,19 @@ def _default_ui_anchor_export_path_provider(
     selected, _selected_filter = QFileDialog.getSaveFileName(
         parent,
         "导出当前 UI 锚点掩码可视化",
+        str(default_path),
+        "PNG 图像 (*.png)",
+    )
+    return selected
+
+
+def _default_ui_anchor_source_overlay_export_path_provider(
+    parent: QWidget,
+    default_path: Path,
+) -> str:
+    selected, _selected_filter = QFileDialog.getSaveFileName(
+        parent,
+        "导出当前 UI 锚点源帧覆盖图",
         str(default_path),
         "PNG 图像 (*.png)",
     )
@@ -161,8 +190,14 @@ class MinimalTraceWindow(QMainWindow):
         ui_anchor_session_factory: SessionFactory = (
             _default_ui_anchor_session_factory
         ),
+        ui_anchor_sam_preview_factory: SessionFactory = (
+            _default_ui_anchor_sam_preview_factory
+        ),
         ui_anchor_export_path_provider: ExportPathProvider = (
             _default_ui_anchor_export_path_provider
+        ),
+        ui_anchor_source_overlay_export_path_provider: ExportPathProvider = (
+            _default_ui_anchor_source_overlay_export_path_provider
         ),
     ) -> None:
         super().__init__()
@@ -176,7 +211,11 @@ class MinimalTraceWindow(QMainWindow):
         self._icon_recorder_factory = icon_recorder_factory
         self._icon_segmentation_factory = icon_segmentation_factory
         self._ui_anchor_session_factory = ui_anchor_session_factory
+        self._ui_anchor_sam_preview_factory = ui_anchor_sam_preview_factory
         self._ui_anchor_export_path_provider = ui_anchor_export_path_provider
+        self._ui_anchor_source_overlay_export_path_provider = (
+            ui_anchor_source_overlay_export_path_provider
+        )
         self._capabilities = {
             getattr(capability, "backend_id"): capability
             for capability in backend_probe()
@@ -194,7 +233,18 @@ class MinimalTraceWindow(QMainWindow):
         self._ui_anchor_image: QImage | None = None
         self._ui_anchor_preview_frame_id: str | None = None
         self._ui_anchor_preview_scope_id: str | None = None
+        self._ui_anchor_preview_snapshot: UiAnchorPreview | None = None
         self._active_ui_anchor_scope_id: str | None = None
+        self._ui_anchor_source_overlay_image: QImage | None = None
+        self._ui_anchor_source_overlay_frame_id: str | None = None
+        self._ui_anchor_source_overlay_scope_id: str | None = None
+        self._ui_anchor_sam_session = None
+        self._ui_anchor_sam_batch: UiAnchorSamPreviewBatch | None = None
+        self._ui_anchor_sam_images: list[QImage | None] = []
+        self._ui_anchor_sam_details: list[str] = []
+        self._ui_anchor_sam_statuses: list[str] = []
+        self._ui_anchor_sam_image: QImage | None = None
+        self._ui_anchor_sam_completion_logged = False
         self._pending_icon_segmentation_event = None
         self._last_icon_segmentation_sequence = 0
         self._icon_sam_detail: str | None = None
@@ -308,9 +358,11 @@ class MinimalTraceWindow(QMainWindow):
             "且移动模型覆盖足够的画布边侧后，才累计屏幕坐标固定的"
             "稳定像素与半透明固定形状；强变化不能单独放行。"
             "达到详细参数设定的有效支持目标（默认 50 次）后，可在"
-            "原有种子掩码附近继续做有界增量补充，结束后只登记一次 "
-            "PROVISIONAL UI 锚点候选；"
-            "它不调用 SAM、不识别图标，也不宣布当前 UI 状态。"
+            "原有种子掩码附近完成首次有界补充并登记一次 "
+            "PROVISIONAL UI 锚点基线；随后掩码在本次实验运行中持续"
+            "动态增加和减少，不会因首次确认而冻结；"
+            "发现过程本身不调用 SAM、不识别图标，也不宣布当前 UI 状态；"
+            "旁边的手动按钮只生成独立复核预览。"
         )
         self.output_edit = QLineEdit(str(self._output_root))
         self.output_browse_button = QPushButton("选择目录")
@@ -325,7 +377,7 @@ class MinimalTraceWindow(QMainWindow):
         action_row = QHBoxLayout()
         self.mode_hint = QLabel(
             "采集→关键帧/OCR；UI锚点旁路→世界运动→固定区域累计→"
-            "可选掩码补充；"
+            "首次确认→动态掩码；"
             "图标/SAM为独立旁路；普通帧不落盘"
         )
         self.mode_hint.setStyleSheet("color: #60656f;")
@@ -366,9 +418,30 @@ class MinimalTraceWindow(QMainWindow):
         self.ui_anchor_export_button.setEnabled(False)
         self.ui_anchor_export_button.setToolTip(
             "将当前 UI 锚点整帧调试投影保存为无损 PNG；"
-            "只响应本次手动操作，不保存普通采样帧或新增候选。"
+            "只响应本次手动操作并冻结点击瞬间的预览，"
+            "不会停止后续动态掩码更新；"
+            "不保存普通采样帧或新增候选。"
+        )
+        self.ui_anchor_source_overlay_button = QPushButton("源帧掩码覆盖")
+        self.ui_anchor_source_overlay_button.setEnabled(False)
+        self.ui_anchor_source_overlay_button.setToolTip(
+            "冻结当前 UI 锚点分析帧，将当前直接证据掩码按 FIT 坐标"
+            "映射回同一源 FramePacket，并在独立标签页显示半透明覆盖；"
+            "这只是点击瞬间的复核快照，不会冻结检测；"
+            "不调用 SAM、不写盘，也不改变候选或 UI 状态。"
+        )
+        self.ui_anchor_sam_preview_button = QPushButton("逐掩码 SAM 预览")
+        self.ui_anchor_sam_preview_button.setEnabled(False)
+        self.ui_anchor_sam_preview_button.setToolTip(
+            "冻结当前 UI 锚点分析帧，将去重后的每个直接证据掩码"
+            "映射回同一源帧裁剪并顺序调用 SAM；结果仅保存在内存"
+            "预览标签页，检测仍继续更新；不登记模板，也不改变 UI 状态。"
         )
         ui_anchor_preview_actions.addStretch(1)
+        ui_anchor_preview_actions.addWidget(
+            self.ui_anchor_source_overlay_button
+        )
+        ui_anchor_preview_actions.addWidget(self.ui_anchor_sam_preview_button)
         ui_anchor_preview_actions.addWidget(self.ui_anchor_export_button)
         ui_anchor_preview_layout = self.ui_anchor_preview_group.layout()
         if isinstance(ui_anchor_preview_layout, QVBoxLayout):
@@ -378,6 +451,70 @@ class MinimalTraceWindow(QMainWindow):
             "最近固定 HUD / SAM 候选",
             "图标记录未启用或尚未确认",
         )
+        (
+            self.ui_anchor_source_overlay_group,
+            self.ui_anchor_source_overlay_preview,
+        ) = self._preview_group(
+            "UI 锚点源帧掩码覆盖",
+            "请先在 UI 锚点页生成掩码，再手动映射到源帧",
+        )
+        self.ui_anchor_source_overlay_detail_label = QLabel(
+            "尚未生成源帧覆盖；结果只用于人工核对映射"
+        )
+        self.ui_anchor_source_overlay_detail_label.setWordWrap(True)
+        self.ui_anchor_source_overlay_detail_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.ui_anchor_source_overlay_detail_label.setStyleSheet(
+            "color: #b9c0ca;"
+        )
+        ui_anchor_source_overlay_actions = QHBoxLayout()
+        self.ui_anchor_source_overlay_export_button = QPushButton(
+            "导出覆盖图…"
+        )
+        self.ui_anchor_source_overlay_export_button.setEnabled(False)
+        self.ui_anchor_source_overlay_export_button.setToolTip(
+            "将当前标签页已经冻结的源分辨率覆盖图保存为无损 PNG；"
+            "不重新分析、不调用 SAM，也不会改用后来到达的新帧。"
+        )
+        ui_anchor_source_overlay_actions.addStretch(1)
+        ui_anchor_source_overlay_actions.addWidget(
+            self.ui_anchor_source_overlay_export_button
+        )
+        ui_anchor_source_overlay_layout = (
+            self.ui_anchor_source_overlay_group.layout()
+        )
+        if isinstance(ui_anchor_source_overlay_layout, QVBoxLayout):
+            ui_anchor_source_overlay_layout.addLayout(
+                ui_anchor_source_overlay_actions
+            )
+            ui_anchor_source_overlay_layout.addWidget(
+                self.ui_anchor_source_overlay_detail_label
+            )
+        (
+            self.ui_anchor_sam_preview_group,
+            self.ui_anchor_sam_preview,
+        ) = self._preview_group(
+            "UI 锚点逐掩码 SAM",
+            "请先在 UI 锚点页生成掩码，再手动启动 SAM",
+        )
+        ui_anchor_sam_selector_row = QHBoxLayout()
+        ui_anchor_sam_selector_row.addWidget(QLabel("掩码结果"))
+        self.ui_anchor_sam_result_combo = QComboBox()
+        self.ui_anchor_sam_result_combo.setEnabled(False)
+        ui_anchor_sam_selector_row.addWidget(self.ui_anchor_sam_result_combo, 1)
+        self.ui_anchor_sam_detail_label = QLabel(
+            "SAM 尚未运行；结果只用于人工查看"
+        )
+        self.ui_anchor_sam_detail_label.setWordWrap(True)
+        self.ui_anchor_sam_detail_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.ui_anchor_sam_detail_label.setStyleSheet("color: #b9c0ca;")
+        ui_anchor_sam_layout = self.ui_anchor_sam_preview_group.layout()
+        if isinstance(ui_anchor_sam_layout, QVBoxLayout):
+            ui_anchor_sam_layout.insertLayout(0, ui_anchor_sam_selector_row)
+            ui_anchor_sam_layout.addWidget(self.ui_anchor_sam_detail_label)
         icon_template_actions = QHBoxLayout()
         self.icon_template_accept_button = QPushButton("登记为临时模板")
         self.icon_template_reject_button = QPushButton("拒绝本次掩码")
@@ -397,6 +534,14 @@ class MinimalTraceWindow(QMainWindow):
         self.evidence_tabs = QTabWidget()
         self.evidence_tabs.addTab(self.keyframe_preview_group, "关键帧")
         self.evidence_tabs.addTab(self.ui_anchor_preview_group, "UI 锚点")
+        self.evidence_tabs.addTab(
+            self.ui_anchor_source_overlay_group,
+            "源帧覆盖",
+        )
+        self.evidence_tabs.addTab(
+            self.ui_anchor_sam_preview_group,
+            "锚点 SAM",
+        )
         self.evidence_tabs.addTab(self.icon_preview_group, "图标 / SAM")
         if self.ui_anchor_check.isChecked():
             self.evidence_tabs.setCurrentWidget(self.ui_anchor_preview_group)
@@ -479,6 +624,18 @@ class MinimalTraceWindow(QMainWindow):
         self.evidence_tabs.currentChanged.connect(self._evidence_tab_changed)
         self.ui_anchor_export_button.clicked.connect(
             self._export_ui_anchor_visualization
+        )
+        self.ui_anchor_source_overlay_button.clicked.connect(
+            self._show_ui_anchor_source_overlay
+        )
+        self.ui_anchor_source_overlay_export_button.clicked.connect(
+            self._export_ui_anchor_source_overlay
+        )
+        self.ui_anchor_sam_preview_button.clicked.connect(
+            self._start_ui_anchor_sam_preview
+        )
+        self.ui_anchor_sam_result_combo.currentIndexChanged.connect(
+            self._ui_anchor_sam_result_changed
         )
         self.advanced_settings_button.clicked.connect(self._open_advanced_settings)
         self.start_button.clicked.connect(self._start_requested)
@@ -633,6 +790,500 @@ class MinimalTraceWindow(QMainWindow):
         self._append_log(message)
         self.statusBar().showMessage(message, 5_000)
 
+    def _show_ui_anchor_source_overlay(self) -> None:
+        snapshot = self._ui_anchor_preview_snapshot
+        if not isinstance(snapshot, UiAnchorPreview):
+            self._update_ui_anchor_source_overlay_button()
+            self.statusBar().showMessage(
+                "当前 UI 锚点预览没有可映射的同帧源图与掩码",
+                5_000,
+            )
+            return
+        try:
+            overlay = build_ui_anchor_source_overlay(snapshot)
+            image = self._rgb_to_qimage(overlay.rgb_pixels)
+        except (AttributeError, TypeError, ValueError) as exc:
+            message = f"生成源帧掩码覆盖失败：{exc}"
+            self.metric_labels["error"].setText(message)
+            self.ui_anchor_source_overlay_detail_label.setText(message)
+            self._append_log(message)
+            self.statusBar().showMessage(message, 5_000)
+            self._update_ui_anchor_source_overlay_button()
+            return
+
+        self._ui_anchor_source_overlay_image = image
+        self._ui_anchor_source_overlay_frame_id = overlay.frame_id
+        self._ui_anchor_source_overlay_scope_id = overlay.scope_id
+        self.ui_anchor_source_overlay_export_button.setEnabled(True)
+        self._set_preview_image(
+            self.ui_anchor_source_overlay_preview,
+            image,
+        )
+        self.ui_anchor_source_overlay_detail_label.setText(
+            self._format_ui_anchor_source_overlay_detail(overlay)
+        )
+        self.evidence_tabs.setCurrentWidget(
+            self.ui_anchor_source_overlay_group
+        )
+        message = (
+            f"已将 frame {overlay.frame_id} 的当前 UI 锚点掩码"
+            "覆盖到同帧源图（仅内存预览）"
+        )
+        self._append_log(message)
+        self.statusBar().showMessage(message, 5_000)
+
+    def _export_ui_anchor_source_overlay(self) -> None:
+        current_image = self._ui_anchor_source_overlay_image
+        if current_image is None or current_image.isNull():
+            self.ui_anchor_source_overlay_export_button.setEnabled(False)
+            self.statusBar().showMessage(
+                "暂无可导出的 UI 锚点源帧覆盖图",
+                5_000,
+            )
+            return
+
+        image = current_image.copy()
+        frame_id = self._ui_anchor_source_overlay_frame_id
+        scope_id = self._ui_anchor_source_overlay_scope_id
+        output_text = self.output_edit.text().strip()
+        output_directory = (
+            Path(output_text).expanduser() if output_text else self._output_root
+        )
+        safe_frame_id = self._safe_export_filename_component(frame_id)
+        default_path = output_directory / (
+            "ui-anchor-source-overlay-"
+            f"{datetime.now():%Y%m%d-%H%M%S}-{safe_frame_id}.png"
+        )
+        selected = self._choose_ui_anchor_source_overlay_export_path(
+            default_path
+        )
+        if not selected:
+            return
+
+        destination = Path(selected).expanduser()
+        if destination.suffix.lower() != ".png":
+            destination = destination.with_name(f"{destination.name}.png")
+        try:
+            saved = image.save(str(destination), "PNG")
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._report_ui_anchor_export_error(
+                f"导出 UI 锚点源帧覆盖图失败：{exc}"
+            )
+            return
+        if not saved:
+            self._report_ui_anchor_export_error(
+                f"导出 UI 锚点源帧覆盖图失败：无法写入 {destination}"
+            )
+            return
+
+        identity = " · ".join(
+            part
+            for part in (
+                f"frame {frame_id}" if frame_id else "",
+                f"scope {scope_id}" if scope_id else "",
+            )
+            if part
+        )
+        message = f"已导出 UI 锚点源帧覆盖图：{destination}"
+        if identity:
+            message = f"{message}（{identity}）"
+        self._append_log(message)
+        self.statusBar().showMessage(message, 5_000)
+
+    def _choose_ui_anchor_source_overlay_export_path(
+        self,
+        default_path: Path,
+    ) -> str:
+        return self._ui_anchor_source_overlay_export_path_provider(
+            self,
+            default_path,
+        )
+
+    @staticmethod
+    def _format_ui_anchor_source_overlay_detail(overlay: object) -> str:
+        pixels = np.asarray(getattr(overlay, "rgb_pixels"))
+        height, width = pixels.shape[:2]
+        layer_parts: list[str] = []
+        for layer in tuple(getattr(overlay, "layers", ()) or ()):
+            key = str(getattr(layer, "layer_key", "mask"))
+            label = str(getattr(layer, "label", key))
+            source_pixels = int(
+                getattr(layer, "source_pixel_count", 0)
+            )
+            mask_count = int(
+                getattr(layer, "applied_region_count", 0)
+            )
+            if source_pixels <= 0 and mask_count <= 0:
+                continue
+            count_text = "" if mask_count <= 0 else f" / {mask_count} 个掩码"
+            layer_parts.append(
+                f"{label} {source_pixels} px{count_text}"
+            )
+        layers_text = "；".join(layer_parts) if layer_parts else "无有效层"
+        issues = tuple(getattr(overlay, "issues", ()) or ())
+        issue_text = (
+            ""
+            if not issues
+            else f"；跳过 {len(issues)} 项畸形证据"
+        )
+        return (
+            f"frame {getattr(overlay, 'frame_id', 'UNKNOWN')} · "
+            f"scope {getattr(overlay, 'scope_id', 'UNKNOWN')} · "
+            f"源帧 {width}×{height} · "
+            f"覆盖 {int(getattr(overlay, 'total_source_pixels', 0))} px"
+            f"{issue_text}；{layers_text}。"
+            "颜色沿用 UI 锚点调试语义；仅供坐标核对，"
+            "不调用 SAM、不登记候选或 UI 状态；生成本身不自动写盘，"
+            "只有显式点击“导出覆盖图…”才保存当前冻结 PNG。"
+        )
+
+    def _start_ui_anchor_sam_preview(self) -> None:
+        if self._ui_anchor_sam_session is not None:
+            self.statusBar().showMessage("逐掩码 SAM 仍在处理上一批", 5_000)
+            return
+        if self._automatic_icon_sam_may_be_running():
+            message = (
+                "固定 HUD 自动 SAM 正随采集启用；请先停止采集，"
+                "再运行逐掩码 SAM，避免同一设备并发加载两份模型"
+            )
+            self.ui_anchor_sam_detail_label.setText(message)
+            self.statusBar().showMessage(message, 5_000)
+            return
+        if not self._advanced_settings.icon_sam_enabled:
+            message = "详细参数中的 SAM 预览当前未启用"
+            self.ui_anchor_sam_detail_label.setText(message)
+            self.statusBar().showMessage(message, 5_000)
+            return
+        snapshot = self._ui_anchor_preview_snapshot
+        if snapshot is None:
+            self._update_ui_anchor_sam_button()
+            self.statusBar().showMessage(
+                "当前 UI 锚点预览没有可用的同帧源图与掩码",
+                5_000,
+            )
+            return
+        try:
+            batch = build_ui_anchor_sam_preview_batch(snapshot)
+        except (AttributeError, TypeError, ValueError) as exc:
+            message = f"无法生成逐掩码 SAM 批次：{exc}"
+            self.metric_labels["error"].setText(message)
+            self.ui_anchor_sam_detail_label.setText(message)
+            self._append_log(message)
+            self.statusBar().showMessage(message, 5_000)
+            self._update_ui_anchor_sam_button()
+            return
+
+        self._install_ui_anchor_sam_batch(batch)
+        session = None
+        try:
+            session = self._ui_anchor_sam_preview_factory(
+                batch=batch,
+                device=self._advanced_settings.icon_sam_device,
+                response_timeout_s=self._advanced_settings.icon_sam_timeout_s,
+            )
+            for method_name in ("start", "request_stop", "join"):
+                if not callable(getattr(session, method_name, None)):
+                    raise TypeError(
+                        "UI anchor SAM session must provide "
+                        "start, request_stop, and join"
+                    )
+            if getattr(session, "results", None) is None:
+                raise TypeError("UI anchor SAM session must expose a results queue")
+            self._ui_anchor_sam_session = session
+            session.start()
+        except Exception as exc:
+            if session is not None:
+                try:
+                    session.request_stop()
+                except Exception:
+                    pass
+                if self._is_alive(session):
+                    self._ui_anchor_sam_session = session
+                else:
+                    try:
+                        session.join(timeout=0)
+                    except Exception:
+                        pass
+                    self._ui_anchor_sam_session = None
+            else:
+                self._ui_anchor_sam_session = None
+            message = f"逐掩码 SAM 启动失败：{type(exc).__name__}: {exc}"
+            self.metric_labels["error"].setText(message)
+            self.ui_anchor_sam_detail_label.setText(message)
+            self._append_log(message)
+            self.statusBar().showMessage(message, 5_000)
+            self._update_ui_anchor_sam_button()
+            return
+
+        self.ui_anchor_sam_preview_button.setEnabled(False)
+        self.evidence_tabs.setCurrentWidget(self.ui_anchor_sam_preview_group)
+        omitted_text = (
+            ""
+            if batch.omitted_target_count == 0
+            else f"（资源预算省略 {batch.omitted_target_count} 个）"
+        )
+        message = (
+            f"逐掩码 SAM 已冻结 frame {batch.frame_id}："
+            f"{len(batch.items)}/{batch.source_target_count} 个去重目标"
+            f"{omitted_text}，"
+            "正在顺序处理"
+        )
+        self._append_log(message)
+        self.statusBar().showMessage(message, 5_000)
+
+    def _install_ui_anchor_sam_batch(
+        self,
+        batch: UiAnchorSamPreviewBatch,
+    ) -> None:
+        self._ui_anchor_sam_batch = batch
+        self._ui_anchor_sam_completion_logged = False
+        self._ui_anchor_sam_images = []
+        self._ui_anchor_sam_details = []
+        self._ui_anchor_sam_statuses = ["PENDING"] * len(batch.items)
+        previous = self.ui_anchor_sam_result_combo.blockSignals(True)
+        try:
+            self.ui_anchor_sam_result_combo.clear()
+            for index, item in enumerate(batch.items, start=1):
+                prompt_image = self._rgb_to_qimage(
+                    render_ui_anchor_sam_prompt(item)
+                )
+                self._ui_anchor_sam_images.append(prompt_image)
+                self._ui_anchor_sam_details.append(
+                    self._format_ui_anchor_sam_pending_detail(
+                        batch,
+                        item,
+                        index=index,
+                    )
+                )
+                self.ui_anchor_sam_result_combo.addItem(
+                    f"{index}/{len(batch.items)} · {item.label} · 等待处理",
+                    index - 1,
+                )
+            self.ui_anchor_sam_result_combo.setCurrentIndex(0)
+        finally:
+            self.ui_anchor_sam_result_combo.blockSignals(previous)
+        self.ui_anchor_sam_result_combo.setEnabled(len(batch.items) > 1)
+        self._show_ui_anchor_sam_result(0)
+
+    def _drain_ui_anchor_sam_previews(self) -> None:
+        session = self._ui_anchor_sam_session
+        if session is None:
+            return
+        self._drain_ui_anchor_sam_result_queue(session)
+        if self._is_alive(session):
+            return
+        if not session.join(timeout=0):
+            return
+        # The worker may publish its final event after the first queue-empty
+        # observation but before exiting.  Once join confirms termination, a
+        # second drain closes that race before the session reference is released.
+        self._drain_ui_anchor_sam_result_queue(session)
+        failure = getattr(session, "failure", None)
+        batch = self._ui_anchor_sam_batch
+        if not self._ui_anchor_sam_completion_logged:
+            if failure is not None:
+                message = f"逐掩码 SAM 批次异常结束：{failure}"
+                self.metric_labels["error"].setText(str(failure))
+            elif batch is None:
+                message = "旧范围的逐掩码 SAM 已取消"
+            else:
+                completed = sum(
+                    status != "PENDING"
+                    for status in self._ui_anchor_sam_statuses
+                )
+                omitted_text = (
+                    ""
+                    if batch.omitted_target_count == 0
+                    else f"；资源预算省略 {batch.omitted_target_count} 个"
+                )
+                message = (
+                    f"逐掩码 SAM 已完成 {completed}/{len(batch.items)}"
+                    f"{omitted_text}；结果仍是人工复核证据，不是 UI 状态"
+                )
+            self._append_log(message)
+            self.statusBar().showMessage(message, 5_000)
+            self._ui_anchor_sam_completion_logged = True
+        self._ui_anchor_sam_session = None
+        self._ui_anchor_sam_batch = None
+        self._update_ui_anchor_sam_button()
+
+    def _drain_ui_anchor_sam_result_queue(self, session: object) -> None:
+        result_queue = getattr(session, "results", None)
+        if result_queue is not None:
+            while True:
+                try:
+                    event = result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._display_ui_anchor_sam_event(event)
+
+    def _display_ui_anchor_sam_event(self, event: object) -> None:
+        batch = self._ui_anchor_sam_batch
+        if batch is None or getattr(event, "batch_id", None) != batch.batch_id:
+            return
+        index = int(getattr(event, "item_index", -1))
+        if not 0 <= index < len(batch.items):
+            return
+        item = batch.items[index]
+        result = getattr(event, "result", None)
+        status_object = getattr(result, "status", IconSegmentationStatus.UNKNOWN)
+        status = str(getattr(status_object, "value", status_object))
+        self._ui_anchor_sam_statuses[index] = status
+        overlay = getattr(result, "overlay_rgb", None)
+        if status == IconSegmentationStatus.SUCCEEDED.value and overlay is not None:
+            try:
+                self._ui_anchor_sam_images[index] = self._rgb_to_qimage(overlay)
+            except (TypeError, ValueError) as exc:
+                self.metric_labels["error"].setText(str(exc))
+        self._ui_anchor_sam_details[index] = (
+            self._format_ui_anchor_sam_result_detail(event)
+        )
+        self.ui_anchor_sam_result_combo.setItemText(
+            index,
+            f"{index + 1}/{len(batch.items)} · {item.label} · {status}",
+        )
+        if self.ui_anchor_sam_result_combo.currentIndex() == index:
+            self._show_ui_anchor_sam_result(index)
+
+    def _ui_anchor_sam_result_changed(self, index: int) -> None:
+        self._show_ui_anchor_sam_result(index)
+
+    def _show_ui_anchor_sam_result(self, index: int) -> None:
+        if not 0 <= index < len(self._ui_anchor_sam_images):
+            self._ui_anchor_sam_image = None
+            self.ui_anchor_sam_preview.clear()
+            self.ui_anchor_sam_preview.setText("暂无逐掩码 SAM 结果")
+            self.ui_anchor_sam_detail_label.setText(
+                "SAM 尚未运行；结果只用于人工查看"
+            )
+            return
+        image = self._ui_anchor_sam_images[index]
+        if image is not None:
+            self._ui_anchor_sam_image = image
+            self._set_preview_image(self.ui_anchor_sam_preview, image)
+        self.ui_anchor_sam_detail_label.setText(
+            self._ui_anchor_sam_details[index]
+        )
+
+    @staticmethod
+    def _format_ui_anchor_sam_pending_detail(
+        batch: UiAnchorSamPreviewBatch,
+        item,
+        *,
+        index: int,
+    ) -> str:
+        prompt = item.request.prompt
+        return (
+            f"{index}/{len(batch.items)}"
+            f"（本帧 {batch.source_target_count}，省略 "
+            f"{batch.omitted_target_count}） · {item.label} · PENDING · "
+            f"frame {batch.frame_id} · stage {item.source_stage} · "
+            f"tight {item.tight_bbox_canvas} · loose {item.loose_bbox_canvas} · "
+            f"source crop {item.crop_box_source} · "
+            f"正点 {len(prompt.positive_points)}；"
+            "当前显示为提示框，等待 SAM 覆盖图"
+        )
+
+    @staticmethod
+    def _format_ui_anchor_sam_result_detail(event: object) -> str:
+        item = getattr(event, "item")
+        result = getattr(event, "result")
+        status_object = getattr(result, "status", IconSegmentationStatus.UNKNOWN)
+        status = str(getattr(status_object, "value", status_object))
+        qa = getattr(result, "qa", None)
+        qa_object = getattr(qa, "status", IconSegmentationQaStatus.UNKNOWN)
+        qa_status = str(getattr(qa_object, "value", qa_object))
+        score = getattr(result, "score", None)
+        score_text = "—" if score is None else f"{float(score):.3f}"
+        reason_code = str(getattr(result, "reason_code", "UNKNOWN"))
+        error = getattr(result, "error", None)
+        error_text = "" if not error else f" · error {error}"
+        elapsed = float(getattr(event, "elapsed_ms", 0.0))
+        return (
+            f"{int(getattr(event, 'item_index', 0)) + 1}/"
+            f"{int(getattr(event, 'item_count', 0))} · {item.label} · "
+            f"{status} · QA {qa_status} · score {score_text} · "
+            f"{reason_code} · {elapsed:.0f} ms · "
+            f"tight {item.tight_bbox_canvas} · loose {item.loose_bbox_canvas} · "
+            f"source crop {item.crop_box_source}{error_text}；"
+            "仅供人工复核，不登记模板、不宣布 UI 状态"
+        )
+
+    def _update_ui_anchor_sam_button(self) -> None:
+        snapshot = self._ui_anchor_preview_snapshot
+        available = bool(
+            self._ui_anchor_sam_session is None
+            and not self._automatic_icon_sam_may_be_running()
+            and self._advanced_settings.icon_sam_enabled
+            and isinstance(snapshot, UiAnchorPreview)
+            and snapshot.source_frame is not None
+            and snapshot.canvas_rgb_pixels is not None
+            and ui_anchor_sam_target_count(snapshot) > 0
+        )
+        self.ui_anchor_sam_preview_button.setEnabled(available)
+
+    def _update_ui_anchor_source_overlay_button(self) -> None:
+        snapshot = self._ui_anchor_preview_snapshot
+        available = bool(
+            isinstance(snapshot, UiAnchorPreview)
+            and snapshot.source_frame is not None
+            and snapshot.canvas_rgb_pixels is not None
+            and ui_anchor_source_overlay_mask_count(snapshot) > 0
+        )
+        self.ui_anchor_source_overlay_button.setEnabled(available)
+
+    def _clear_ui_anchor_source_overlay(self) -> None:
+        self._ui_anchor_source_overlay_image = None
+        self._ui_anchor_source_overlay_frame_id = None
+        self._ui_anchor_source_overlay_scope_id = None
+        self.ui_anchor_source_overlay_preview.clear()
+        self.ui_anchor_source_overlay_preview.setText(
+            "请先在 UI 锚点页生成掩码，再手动映射到源帧"
+        )
+        self.ui_anchor_source_overlay_detail_label.setText(
+            "尚未生成源帧覆盖；结果只用于人工核对映射"
+        )
+        self.ui_anchor_source_overlay_export_button.setEnabled(False)
+        self.ui_anchor_source_overlay_button.setEnabled(False)
+
+    def _automatic_icon_sam_may_be_running(self) -> bool:
+        return bool(
+            self._keyframe_session is not None
+            and self.icon_record_check.isChecked()
+            and self._advanced_settings.icon_sam_enabled
+        )
+
+    def _cancel_ui_anchor_sam_preview(
+        self,
+        *,
+        clear_snapshot: bool,
+        clear_results: bool,
+    ) -> None:
+        session = self._ui_anchor_sam_session
+        if session is not None:
+            session.request_stop()
+        self._ui_anchor_sam_batch = None
+        self._ui_anchor_sam_completion_logged = False
+        if clear_snapshot:
+            self._ui_anchor_preview_snapshot = None
+            self._clear_ui_anchor_source_overlay()
+        if clear_results:
+            self._ui_anchor_sam_images = []
+            self._ui_anchor_sam_details = []
+            self._ui_anchor_sam_statuses = []
+            self._ui_anchor_sam_image = None
+            self.ui_anchor_sam_result_combo.clear()
+            self.ui_anchor_sam_result_combo.setEnabled(False)
+            self.ui_anchor_sam_preview.clear()
+            self.ui_anchor_sam_preview.setText(
+                "请先在 UI 锚点页生成掩码，再手动启动 SAM"
+            )
+            self.ui_anchor_sam_detail_label.setText(
+                "SAM 尚未运行；结果只用于人工查看"
+            )
+        self._update_ui_anchor_sam_button()
+        self._update_ui_anchor_source_overlay_button()
+
     @staticmethod
     def _safe_export_filename_component(value: object) -> str:
         text = str(value or "").strip()
@@ -665,6 +1316,10 @@ class MinimalTraceWindow(QMainWindow):
             self.cursor_capture_check.setChecked(False)
             self._show_ui_anchor_evidence_tab()
         elif self._capture_session is None:
+            self._cancel_ui_anchor_sam_preview(
+                clear_snapshot=True,
+                clear_results=True,
+            )
             self.ui_anchor_detail_label.setText("UI 锚点发现未启用")
         self._persistence_toggled(enabled)
         self._backend_changed()
@@ -692,6 +1347,7 @@ class MinimalTraceWindow(QMainWindow):
             raise RuntimeError("cannot change advanced settings while running")
         self._advanced_settings = settings
         self.advanced_settings_button.setToolTip(settings.summary())
+        self._update_ui_anchor_sam_button()
         self._append_log(f"详细参数已更新：{settings.summary()}")
 
     def _start_requested(self) -> None:
@@ -1066,6 +1722,12 @@ class MinimalTraceWindow(QMainWindow):
             refinement_expansion_radius_px=(
                 settings.ui_anchor_refinement_expansion_radius_px
             ),
+            tracking_add_observations=(
+                settings.ui_anchor_tracking_add_observations
+            ),
+            tracking_remove_observations=(
+                settings.ui_anchor_tracking_remove_observations
+            ),
         )
 
     def _build_icon_catalog_policy(self) -> IconCatalogPolicy:
@@ -1119,6 +1781,7 @@ class MinimalTraceWindow(QMainWindow):
             self._keyframe_session.request_stop()
 
     def _poll_sessions(self) -> None:
+        self._drain_ui_anchor_sam_previews()
         session = self._keyframe_session
         if session is not None:
             self._refresh_session_outputs(session)
@@ -1150,8 +1813,8 @@ class MinimalTraceWindow(QMainWindow):
         ui_anchor_event_state = self._drain_ui_anchor_events(session)
         if ui_anchor_event_state is None:
             ui_anchor_event_state = scope_state
-        self._drain_ui_anchor_previews(session)
         self._drain_ui_anchor_candidates(session)
+        self._drain_ui_anchor_previews(session)
         self._drain_icon_candidates(session)
         self._drain_icon_segmentations(session)
         self._drain_icon_template_matches(session)
@@ -1174,9 +1837,14 @@ class MinimalTraceWindow(QMainWindow):
         ui_anchor_refining = int(
             getattr(stats, "ui_anchor_refining_regions", 0)
         )
+        ui_anchor_tracking = int(
+            getattr(stats, "ui_anchor_tracking_regions", 0)
+        )
         ui_anchor_state = str(getattr(session, "ui_anchor_state", "DISABLED"))
         if ui_anchor_event_state is not None:
             ui_anchor_state = ui_anchor_event_state
+        elif ui_anchor_tracking > 0:
+            ui_anchor_state = f"TRACKING · {ui_anchor_tracking} 个动态掩码"
         elif ui_anchor_refining > 0:
             ui_anchor_state = f"REFINING · {ui_anchor_refining} 个区域"
         self.metric_labels["ui_anchor_state"].setText(ui_anchor_state)
@@ -1201,6 +1869,7 @@ class MinimalTraceWindow(QMainWindow):
             f"半透明形状 {ui_anchor_translucent_support}/{ui_anchor_target} · "
             f"有效运动支持 {ui_anchor_eligible} · 区域 {ui_anchor_regions} · "
             f"精修中 {ui_anchor_refining} · "
+            f"动态 {ui_anchor_tracking} · "
             f"晋升/保存 {ui_anchor_promoted}/{ui_anchor_persisted} · "
             f"{ui_anchor_reason}"
         )
@@ -1463,11 +2132,16 @@ class MinimalTraceWindow(QMainWindow):
                 if preview_scope_id is None
                 else str(preview_scope_id)
             )
+            self._ui_anchor_preview_snapshot = (
+                preview if isinstance(preview, UiAnchorPreview) else None
+            )
             self._set_preview_image(
                 self.ui_anchor_preview,
                 self._ui_anchor_image,
             )
             self.ui_anchor_export_button.setEnabled(True)
+            self._update_ui_anchor_source_overlay_button()
+            self._update_ui_anchor_sam_button()
             self.ui_anchor_detail_label.setText(
                 self._format_ui_anchor_analysis_detail(
                     getattr(preview, "analysis", None)
@@ -1512,7 +2186,10 @@ class MinimalTraceWindow(QMainWindow):
         refinements = tuple(
             getattr(analysis, "refinement_regions", ()) or ()
         )
-        if not regions and not refinements:
+        tracking_regions = tuple(
+            getattr(analysis, "tracking_regions", ()) or ()
+        )
+        if not regions and not refinements and not tracking_regions:
             reason_code = str(getattr(analysis, "reason_code", "WAITING_FRAME"))
             motion_qualified = getattr(analysis, "motion_qualified", None)
             gate = (
@@ -1525,6 +2202,25 @@ class MinimalTraceWindow(QMainWindow):
             return f"无临时证据区 · 门禁 {gate} · 状态 {state} · 原因 {reason_code}"
 
         sections: list[str] = []
+        if tracking_regions:
+            visible_tracking = [
+                cls._format_ui_anchor_tracking_detail(region, index=index)
+                for index, region in enumerate(tracking_regions[:3], start=1)
+            ]
+            hidden_tracking = max(
+                0,
+                len(tracking_regions) - len(visible_tracking),
+            )
+            tracking_suffix = (
+                ""
+                if hidden_tracking == 0
+                else f" · 另有 {hidden_tracking} 个"
+            )
+            sections.append(
+                f"动态掩码 {len(tracking_regions)} 个 · "
+                + " | ".join(visible_tracking)
+                + tracking_suffix
+            )
         if refinements:
             visible_refinements = [
                 cls._format_ui_anchor_refinement_detail(region, index=index)
@@ -1557,6 +2253,70 @@ class MinimalTraceWindow(QMainWindow):
                 + suffix
             )
         return " || ".join(sections)
+
+    @staticmethod
+    def _format_ui_anchor_tracking_detail(region, *, index: int) -> str:
+        candidate_id = str(
+            getattr(region, "candidate_id", f"dynamic-{index}")
+        )
+        revision = getattr(region, "revision", "—")
+        observations = getattr(region, "observations", "—")
+        active_pixels = getattr(region, "active_pixels", None)
+        if callable(active_pixels):
+            active_pixels = active_pixels()
+        if active_pixels is None:
+            active_pixels = int(
+                np.count_nonzero(
+                    np.asarray(
+                        getattr(
+                            region,
+                            "active_mask",
+                            np.zeros((0, 0), dtype=np.bool_),
+                        ),
+                        dtype=np.bool_,
+                    )
+                )
+            )
+        added_pixels = getattr(region, "added_pixels", None)
+        if callable(added_pixels):
+            added_pixels = added_pixels()
+        if added_pixels is None:
+            added_pixels = int(
+                np.count_nonzero(
+                    np.asarray(
+                        getattr(
+                            region,
+                            "added_mask",
+                            np.zeros((0, 0), dtype=np.bool_),
+                        ),
+                        dtype=np.bool_,
+                    )
+                )
+            )
+        removed_pixels = getattr(region, "removed_pixels", None)
+        if callable(removed_pixels):
+            removed_pixels = removed_pixels()
+        if removed_pixels is None:
+            removed_pixels = int(
+                np.count_nonzero(
+                    np.asarray(
+                        getattr(
+                            region,
+                            "removed_mask",
+                            np.zeros((0, 0), dtype=np.bool_),
+                        ),
+                        dtype=np.bool_,
+                    )
+                )
+            )
+        add_target = getattr(region, "add_observation_target", "—")
+        remove_target = getattr(region, "remove_observation_target", "—")
+        return (
+            f"{candidate_id} [TRACKING] · r{revision} · "
+            f"观察 {observations} · 当前 {active_pixels} px · "
+            f"最近 +{added_pixels}/-{removed_pixels} px · "
+            f"加入/移除确认 {add_target}/{remove_target}"
+        )
 
     @staticmethod
     def _format_ui_anchor_refinement_detail(region, *, index: int) -> str:
@@ -1738,6 +2498,10 @@ class MinimalTraceWindow(QMainWindow):
         return "PRIMING · 新采集范围"
 
     def _activate_ui_anchor_scope(self, scope_id: str) -> None:
+        self._cancel_ui_anchor_sam_preview(
+            clear_snapshot=True,
+            clear_results=True,
+        )
         self._active_ui_anchor_scope_id = scope_id
         self._ui_anchor_image = None
         self._ui_anchor_preview_frame_id = None
@@ -2206,6 +2970,16 @@ class MinimalTraceWindow(QMainWindow):
                 self.ui_anchor_preview,
                 self._ui_anchor_image,
             )
+        if self._ui_anchor_source_overlay_image is not None:
+            self._set_preview_image(
+                self.ui_anchor_source_overlay_preview,
+                self._ui_anchor_source_overlay_image,
+            )
+        if self._ui_anchor_sam_image is not None:
+            self._set_preview_image(
+                self.ui_anchor_sam_preview,
+                self._ui_anchor_sam_image,
+            )
         if self._icon_image is not None:
             self._set_preview_image(self.icon_preview, self._icon_image)
 
@@ -2225,6 +2999,7 @@ class MinimalTraceWindow(QMainWindow):
         self._keyframe_session = None
         self._stopping = False
         self._set_controls_enabled(True)
+        self._update_ui_anchor_sam_button()
         self.stop_button.setEnabled(False)
         if self._last_capture_state != "FAILED":
             self._last_capture_state = "STOPPED"
@@ -2236,6 +3011,10 @@ class MinimalTraceWindow(QMainWindow):
         self._append_log(message)
 
     def _reset_run_display(self) -> None:
+        self._cancel_ui_anchor_sam_preview(
+            clear_snapshot=True,
+            clear_results=True,
+        )
         self._live_image = None
         self._keyframe_image = None
         self._icon_image = None
@@ -2244,6 +3023,8 @@ class MinimalTraceWindow(QMainWindow):
         self._ui_anchor_preview_scope_id = None
         self._active_ui_anchor_scope_id = None
         self.ui_anchor_export_button.setEnabled(False)
+        self.ui_anchor_source_overlay_button.setEnabled(False)
+        self.ui_anchor_sam_preview_button.setEnabled(False)
         self._pending_icon_segmentation_event = None
         self._last_icon_segmentation_sequence = 0
         self._icon_sam_detail = None
@@ -2398,6 +3179,9 @@ class MinimalTraceWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         self._closing = True
         self._poll_timer.stop()
+        ui_anchor_sam_session = self._ui_anchor_sam_session
+        if ui_anchor_sam_session is not None:
+            ui_anchor_sam_session.request_stop()
         if self._capture_session is not None:
             self._capture_session.request_stop()
         if self._keyframe_session is not None:
@@ -2410,6 +3194,11 @@ class MinimalTraceWindow(QMainWindow):
             timeout=2.0
         ):
             self._append_log("关键帧线程尚未退出，窗口继续关闭。")
+        if (
+            ui_anchor_sam_session is not None
+            and not ui_anchor_sam_session.join(timeout=2.0)
+        ):
+            self._append_log("逐掩码 SAM 线程尚未退出，窗口继续关闭。")
         event.accept()
 
 
