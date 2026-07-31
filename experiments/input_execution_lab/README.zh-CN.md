@@ -273,6 +273,11 @@
 锁定指针点击。普通 UI 指针移动、锁定光标和 Raw Input 游戏视角仍需后续分别
 实验；当前方案中的鼠标移动只用于上述客户区指针式绝对采样路径。
 
+独立 [Pointer Context Lab（指针上下文实验）](../pointer_context_lab/README.zh-CN.md)
+会以只读方式输出 `POSITIONED_UI_CANDIDATE`、`LOCKED_RELATIVE_CANDIDATE`、
+`HYBRID_OR_TRANSITION` 或 `UNKNOWN`。这些结果只能辅助人工选择点击语义，不会
+自动修改本实验的录制草稿或 `InputPlan`。
+
 ### 录制诊断标签页
 
 “原始录制事件”和“录制诊断”是两个独立的只读标签页。前者只显示被门禁接纳的

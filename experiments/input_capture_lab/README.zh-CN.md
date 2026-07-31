@@ -263,6 +263,9 @@ ruff format --check experiments\input_capture_lab
 
 - 与截图 `FramePacket` 的同一单调时钟和会话身份对齐；
 - Windows Raw Input 等后端的能力、权限与丢失语义；
+- 由独立 [Pointer Context Lab（指针上下文实验）](../pointer_context_lab/README.zh-CN.md)
+  只读观察光标显示、裁剪区域和传统捕获关系；它只产生上下文候选，不补造本实验
+  未记录的鼠标移动，也不证明目标程序消费了输入；
 - 重复按键、组合键、IME、鼠标捕获和独占输入边界；
 - 长时间运行的事件完整性、回压和终止清理；
 - 明确授权后的易失证据保存与隐私策略；
