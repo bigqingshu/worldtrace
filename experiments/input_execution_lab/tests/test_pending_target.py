@@ -10,6 +10,7 @@ from experiments.input_execution_lab.pending_target import (
     TargetWindowIdentity,
     freeze_window_identity,
 )
+from experiments.input_execution_lab.window_candidate import InputWindowCandidate
 
 
 HWND = 0x1122
@@ -246,6 +247,32 @@ class PendingTargetResolverTests(unittest.TestCase):
 
         identity = freeze_window_identity(
             window,
+            clock=clock,
+            window_predicate=lambda _hwnd: True,
+            process_id_provider=lambda _hwnd: PID,
+            title_provider=lambda _hwnd: "Restoring Game",
+            process_started_at_provider=lambda _pid: STARTED_AT,
+        )
+
+        self.assertEqual(identity.hwnd, HWND)
+        self.assertEqual(identity.process_id, PID)
+        self.assertEqual(identity.process_started_at, STARTED_AT)
+
+    def test_freeze_identity_accepts_minimized_identity_only_candidate(
+        self,
+    ) -> None:
+        clock = _Clock()
+        candidate = InputWindowCandidate(
+            hwnd=HWND,
+            title="Restoring Game",
+            process_id=PID,
+            minimized=True,
+            client_region=None,
+            geometry_error="RuntimeError: zero client",
+        )
+
+        identity = freeze_window_identity(
+            candidate,
             clock=clock,
             window_predicate=lambda _hwnd: True,
             process_id_provider=lambda _hwnd: PID,

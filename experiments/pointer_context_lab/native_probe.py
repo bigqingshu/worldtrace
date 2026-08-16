@@ -606,9 +606,8 @@ class Win32PointerSignalProvider:
             operation="client_rect(target)",
             errors=errors,
         )
-        clip_rect = _convert_rect(
+        clip_rect, clip_point = _convert_clip_rect(
             raw.clip_rect,
-            operation="GetClipCursor",
             errors=errors,
         )
         virtual_desktop_rect = _convert_rect(
@@ -634,8 +633,12 @@ class Win32PointerSignalProvider:
             cursor_info_position=raw.cursor_info_position,
             cursor_position_available=raw.cursor_position_available,
             cursor_position=raw.cursor_position,
-            clip_rect_available=raw.clip_rect_available and clip_rect is not None,
+            clip_rect_available=(
+                raw.clip_rect_available
+                and (clip_rect is not None or clip_point is not None)
+            ),
             clip_rect=clip_rect,
+            clip_point=clip_point,
             virtual_desktop_available=(
                 raw.virtual_desktop_rect is not None
                 and virtual_desktop_rect is not None
@@ -699,6 +702,32 @@ def _convert_rect(
         width=value.width,
         height=value.height,
     )
+
+
+def _convert_clip_rect(
+    value: NativeRect | None,
+    *,
+    errors: list[str],
+) -> tuple[Region | None, tuple[int, int] | None]:
+    if value is None:
+        return None, None
+    if value.width > 0 and value.height > 0:
+        return (
+            Region(
+                left=value.left,
+                top=value.top,
+                width=value.width,
+                height=value.height,
+            ),
+            None,
+        )
+    if value.width == 0 and value.height == 0:
+        return None, (value.left, value.top)
+    errors.append(
+        "GetClipCursor: ValueError: native clipping rectangle has an "
+        "inconsistent non-positive dimension"
+    )
+    return None, None
 
 
 def _require_positive_integer(value: object, name: str) -> None:

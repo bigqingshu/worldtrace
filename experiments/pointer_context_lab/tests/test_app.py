@@ -30,15 +30,45 @@ class _FakeSnapshot:
     candidate: _Candidate
     stability: str
     marker: str
+    sequence: int
+    observed_at_monotonic_ns: int
+    exact_target_foreground: bool
 
     def to_dict(self) -> dict[str, object]:
+        foreground_hwnd = (
+            TARGET_HWND if self.exact_target_foreground else TARGET_HWND + 1
+        )
+        foreground_pid = TARGET_PID if self.exact_target_foreground else TARGET_PID + 1
         return {
             "candidate": self.candidate.value,
             "marker": self.marker,
+            "sequence": self.sequence,
+            "reasons": ["CURSOR_VISIBLE"],
+            "geometry": {
+                "delta": {
+                    "left": 0,
+                    "top": 0,
+                    "width": 0,
+                    "height": 0,
+                },
+            },
             "signals": {
                 "cursor_visible": (
                     self.candidate is _Candidate.POSITIONED_UI_CANDIDATE
                 ),
+                "observed_at_monotonic_ns": self.observed_at_monotonic_ns,
+                "foreground": {
+                    "available": True,
+                    "hwnd": foreground_hwnd,
+                    "process_id": foreground_pid,
+                },
+                "target": {
+                    "window_exists": True,
+                    "root_hwnd": TARGET_HWND,
+                    "current_process_id": TARGET_PID,
+                    "current_process_started_at": 1234.5,
+                    "minimized": False,
+                },
             },
             "stability": {
                 "state": self.stability,
@@ -138,14 +168,19 @@ class PointerContextLabWindowTests(unittest.TestCase):
         candidate: _Candidate,
         stability: str,
         marker: str,
+        exact_target_foreground: bool = True,
     ) -> None:
         target = self.session_calls[0][0] if self.session_calls else object()
+        sequence = len(self.snapshots) + 1
         self.snapshots.append(
             _FakeSnapshot(
                 target=target,
                 candidate=candidate,
                 stability=stability,
                 marker=marker,
+                sequence=sequence,
+                observed_at_monotonic_ns=sequence * 50_000_000,
+                exact_target_foreground=exact_target_foreground,
             )
         )
 
@@ -225,6 +260,34 @@ class PointerContextLabWindowTests(unittest.TestCase):
         self.assertIn('"marker": "new"', raw)
         self.assertNotIn('"marker": "old"', raw)
         self.assertEqual(self.window.sample_label.text(), "成功采样：2")
+
+    def test_last_exact_foreground_snapshot_survives_return_to_lab(self) -> None:
+        self._append_snapshot(
+            candidate=_Candidate.LOCKED_RELATIVE_CANDIDATE,
+            stability="STABLE",
+            marker="game-foreground",
+        )
+        self._append_snapshot(
+            candidate=_Candidate.POSITIONED_UI_CANDIDATE,
+            stability="UNSTABLE",
+            marker="lab-foreground",
+            exact_target_foreground=False,
+        )
+        self.window.start_button.click()
+
+        retained_snapshot = self.window.last_foreground_snapshot
+        self.window._poll()
+
+        self.assertIs(self.window.last_foreground_snapshot, retained_snapshot)
+        self.assertIn(
+            '"marker": "lab-foreground"',
+            self.window.raw_json_edit.toPlainText(),
+        )
+        retained = self.window.last_foreground_json_edit.toPlainText()
+        self.assertIn('"marker": "game-foreground"', retained)
+        self.assertNotIn('"marker": "lab-foreground"', retained)
+        self.assertIn("序号 1", self.window.last_foreground_label.text())
+        self.assertIn("距当前 50 ms", self.window.last_foreground_label.text())
 
     def test_sampling_failure_remains_unknown_and_keeps_polling(self) -> None:
         self._append_snapshot(

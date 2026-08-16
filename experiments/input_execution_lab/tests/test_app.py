@@ -11,7 +11,7 @@ from unittest.mock import PropertyMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from experiments.capture_backends.contracts import Region
@@ -74,6 +74,14 @@ from experiments.input_execution_lab.track_model import TrackColumn
 from experiments.input_execution_lab.window_lifetime import (
     WindowLifetimeSnapshot,
     WindowLifetimeState,
+)
+from experiments.input_execution_lab.window_candidate import InputWindowCandidate
+from experiments.pointer_context_lab import (
+    PointerContextCandidate,
+    PointerContextReasonCode,
+    PointerContextSignals,
+    PointerContextSnapshot,
+    PointerContextTarget,
 )
 
 
@@ -540,6 +548,18 @@ class InputExecutionLabWindowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def tearDown(self) -> None:
+        for widget in QApplication.topLevelWidgets():
+            if not isinstance(widget, InputExecutionLabWindow):
+                continue
+            overlay = widget._overlay
+            widget.close()
+            overlay.close()
+            overlay.deleteLater()
+            widget.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+
     def _window(self, root: Path, **kwargs) -> InputExecutionLabWindow:
         kwargs.setdefault(
             "pending_target_factory",
@@ -953,6 +973,163 @@ class InputExecutionLabWindowTests(unittest.TestCase):
                 )
                 self.assertIn("DPI 192 / 200%", window.target_label.text())
                 self.assertTrue(window._dirty)
+            finally:
+                window.close()
+
+    def test_recording_binds_locked_pointer_context_to_direct_click(self) -> None:
+        down_at = 1_100_000_000
+        up_at = 1_180_000_000
+
+        def mouse_pair() -> tuple[InputCaptureEvent, InputCaptureEvent]:
+            common = {
+                "session_id": "capture-session",
+                "session_started_at_monotonic_ns": 1_000_000_000,
+                "focus_epoch": 1,
+                "device": InputDevice.MOUSE,
+                "key_or_button": "left",
+                "target_hwnd": _WINDOW.hwnd,
+                "target_process_id": _WINDOW.process_id,
+                "target_window_title": _WINDOW.title,
+                "capture_backend": "fake",
+                "status": InputCaptureEventStatus.ACCEPTED,
+                "screen_position": (500, 500),
+                "client_position": (400, 300),
+                "normalized_position": (0.5, 0.5),
+            }
+            return (
+                InputCaptureEvent(
+                    input_event_id="mouse-down",
+                    input_group_id="mouse-group",
+                    sequence=1,
+                    captured_at_monotonic_ns=down_at,
+                    event_type=InputEventType.MOUSE_BUTTON_DOWN,
+                    **common,
+                ),
+                InputCaptureEvent(
+                    input_event_id="mouse-up",
+                    input_group_id="mouse-group",
+                    sequence=2,
+                    captured_at_monotonic_ns=up_at,
+                    event_type=InputEventType.MOUSE_BUTTON_UP,
+                    press_duration_ns=up_at - down_at,
+                    **common,
+                ),
+            )
+
+        class MouseCaptureSession(_FakeCaptureSession):
+            def __init__(self, target: TargetWindowBinding) -> None:
+                super().__init__(target)
+                self._events = list(mouse_pair())
+
+        class LockedPointerSession:
+            def __init__(self, target: TargetWindowBinding) -> None:
+                self.target = PointerContextTarget(
+                    hwnd=target.hwnd,
+                    process_id=target.process_id,
+                    title=target.title,
+                    client_region=Region(
+                        left=target.client_left,
+                        top=target.client_top,
+                        width=target.client_width,
+                        height=target.client_height,
+                    ),
+                    process_started_at=target.process_started_at,
+                )
+                self.session_id = "pointer-session"
+                self.closed = False
+                self._history = (
+                    self._snapshot(1, down_at - 10_000_000),
+                    self._snapshot(2, up_at - 10_000_000),
+                )
+
+            def _snapshot(
+                self,
+                sequence: int,
+                observed_at_ns: int,
+            ) -> PointerContextSnapshot:
+                return PointerContextSnapshot(
+                    session_id=self.session_id,
+                    sequence=sequence,
+                    target=self.target,
+                    focus_epoch=1,
+                    candidate=(PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE),
+                    raw_candidate=(PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE),
+                    reasons=(PointerContextReasonCode.CURSOR_HIDDEN,),
+                    signals=PointerContextSignals(
+                        observed_at_monotonic_ns=observed_at_ns,
+                    ),
+                    stability_started_at_monotonic_ns=(observed_at_ns - 200_000_000),
+                    stable_for_ns=200_000_000,
+                    stable_sample_count=4,
+                    required_stability_ns=150_000_000,
+                )
+
+            @property
+            def history(self) -> tuple[PointerContextSnapshot, ...]:
+                return self._history
+
+            def sample(self, *, focus_epoch: int) -> PointerContextSnapshot:
+                self.assert_focus_epoch = focus_epoch
+                return self._history[-1]
+
+            def close(self) -> None:
+                self.closed = True
+
+        capture_sessions: list[MouseCaptureSession] = []
+        pointer_sessions: list[LockedPointerSession] = []
+
+        def capture_factory(
+            target: TargetWindowBinding,
+        ) -> MouseCaptureSession:
+            session = MouseCaptureSession(target)
+            capture_sessions.append(session)
+            return session
+
+        def pointer_factory(
+            target: TargetWindowBinding,
+        ) -> LockedPointerSession:
+            session = LockedPointerSession(target)
+            pointer_sessions.append(session)
+            return session
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = self._window(
+                Path(directory),
+                capture_session_factory=capture_factory,
+                pointer_context_session_factory=pointer_factory,
+            )
+            try:
+                window.record_button.click()
+                window._poll_capture()
+                capture_sessions[0].stop()
+                window._poll_capture()
+
+                plan = window.current_plan
+                self.assertIsNotNone(plan)
+                self.assertEqual(
+                    tuple(event.event_type for event in plan.events),
+                    (
+                        InputPlanEventType.MOUSE_BUTTON_DOWN_DIRECT,
+                        InputPlanEventType.MOUSE_BUTTON_UP_DIRECT,
+                    ),
+                )
+                self.assertTrue(pointer_sessions[0].closed)
+                diagnostic_payloads = [
+                    json.loads(line)
+                    for line in (
+                        window.capture_diagnostics_detail.toPlainText().splitlines()
+                    )
+                ]
+                bindings = [
+                    item
+                    for item in diagnostic_payloads
+                    if item.get("kind") == "pointer_context_binding"
+                ]
+                self.assertEqual(
+                    tuple(item["status"] for item in bindings),
+                    ("BOUND", "BOUND"),
+                )
+                self.assertTrue(all(item["usable"] for item in bindings))
             finally:
                 window.close()
 
@@ -1631,6 +1808,83 @@ class InputExecutionLabWindowTests(unittest.TestCase):
             finally:
                 if sessions:
                     sessions[0].request_stop()
+                window.close()
+
+    def test_identity_only_minimized_candidate_is_listed_and_waits_safely(
+        self,
+    ) -> None:
+        candidate = InputWindowCandidate(
+            hwnd=_WINDOW.hwnd,
+            title=_WINDOW.title,
+            process_id=_WINDOW.process_id,
+            minimized=True,
+            client_region=None,
+            geometry_error=(
+                "RuntimeError: GetClientRect returned a non-positive client size"
+            ),
+        )
+        pending = _FakePendingTarget(_WINDOW)
+        sessions: list[_FakeExecutionSession] = []
+        listeners: list[_FakeEmergencyListener] = []
+        binder_calls: list[InputWindowCandidate] = []
+        pointer_calls: list[TargetWindowBinding] = []
+        capture_calls: list[TargetWindowBinding] = []
+
+        def blocked_binder(selected: InputWindowCandidate) -> TargetWindowBinding:
+            binder_calls.append(selected)
+            raise RuntimeError("目标窗口客户区尺寸无效")
+
+        with tempfile.TemporaryDirectory() as directory:
+            window = InputExecutionLabWindow(
+                window_provider=lambda **_kwargs: (candidate,),
+                target_binder=blocked_binder,
+                pending_target_factory=lambda _window: pending,
+                window_lifetime_factory=lambda selected: _FakeWindowLifetimeGuard(
+                    selected.hwnd
+                ),
+                integrity_probe=_allowed_integrity_snapshot,
+                dpi_probe=_dpi_snapshot,
+                pointer_context_session_factory=lambda target: pointer_calls.append(
+                    target
+                ),
+                capture_session_factory=lambda target: capture_calls.append(target),
+                execution_session_factory=lambda plan, target: sessions.append(
+                    _FakeExecutionSession(plan, target)
+                ),
+                emergency_stop_factory=lambda: listeners.append(
+                    _FakeEmergencyListener()
+                ),
+                plan_store=InputPlanStore(directory),
+                poll_interval_ms=10_000,
+            )
+            try:
+                self.assertEqual(window.window_combo.count(), 1)
+                self.assertIs(window.window_combo.currentData(), candidate)
+                self.assertIn("已最小化", window.window_combo.currentText())
+                self.assertIn("客户区 待恢复", window.target_label.text())
+
+                with patch.object(QMessageBox, "warning") as warning:
+                    window.record_button.click()
+
+                self.assertEqual(binder_calls, [candidate])
+                self.assertEqual(pointer_calls, [])
+                self.assertEqual(capture_calls, [])
+                self.assertIsNone(window._capture_session)
+                warning.assert_called_once_with(
+                    window,
+                    "无法开始录制",
+                    "目标窗口客户区尺寸无效",
+                )
+
+                window.manual_action_panel.add_button.click()
+                window.start_execution_button.click()
+
+                self.assertIs(window._pending_execution_target, pending)
+                self.assertEqual(sessions, [])
+                self.assertEqual(listeners, [])
+                self.assertIsNone(window.execution_session)
+                self.assertIn("未创建发送会话", window.report_label.text())
+            finally:
                 window.close()
 
     def test_destroyed_pending_window_is_blocked_without_input_resources(

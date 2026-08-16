@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from experiments.capture_backends.contracts import WindowArea
+from experiments.capture_backends.contracts import Region, WindowArea
 from experiments.capture_backends.dpi_diagnostics import (
     DpiCoordinateSpace,
     DpiDiagnosticsSnapshot,
@@ -48,17 +48,25 @@ from experiments.capture_backends.target_selector import (
     get_window_region,
     get_window_title,
     is_window,
-    list_windows,
 )
 from experiments.input_capture_lab import (
     FocusGateState,
+    FocusGateSnapshot,
     ForegroundWindowGate,
     InputCaptureDiagnosticsSnapshot,
     InputCaptureEvent,
     InputCaptureSession,
     InputCaptureSessionState,
+    InputDevice,
     TargetWindowBinding,
     bind_window_info,
+)
+from experiments.pointer_context_lab import (
+    PointerContextSession,
+    PointerContextTarget,
+)
+from experiments.pointer_context_lab.native_probe import (
+    Win32PointerSignalProvider,
 )
 
 from .action_builders import new_plan
@@ -102,23 +110,40 @@ from .process_integrity import (
     process_integrity_gate_message,
 )
 from .recording import RecordingCompileError, compile_capture_events
+from .recording_pointer_context import (
+    RecordingPointerContextBinding,
+    bind_capture_event_to_pointer_context,
+)
 from .window_lifetime import (
     WindowLifetimeGuard,
     WindowLifetimeGuardProtocol,
     WindowLifetimeState,
 )
+from .window_candidate import (
+    InputWindowSelection,
+    is_input_window_selection,
+    is_window_minimized,
+    list_input_window_candidates,
+)
 
 
-WindowProvider = Callable[..., Iterable[WindowInfo]]
+WindowProvider = Callable[..., Iterable[InputWindowSelection]]
 CaptureSessionFactory = Callable[[TargetWindowBinding], InputCaptureSession]
+PointerContextSessionFactory = Callable[
+    [TargetWindowBinding],
+    PointerContextSession,
+]
 ExecutionSessionFactory = Callable[
     [InputPlan, TargetWindowBinding],
     InputExecutionSession,
 ]
 EmergencyStopFactory = Callable[[], PynputEmergencyStopListener]
-TargetBinder = Callable[[WindowInfo], TargetWindowBinding]
-PendingTargetFactory = Callable[[WindowInfo], PendingTargetResolver]
-WindowLifetimeFactory = Callable[[WindowInfo], WindowLifetimeGuardProtocol]
+TargetBinder = Callable[[InputWindowSelection], TargetWindowBinding]
+PendingTargetFactory = Callable[[InputWindowSelection], PendingTargetResolver]
+WindowLifetimeFactory = Callable[
+    [InputWindowSelection],
+    WindowLifetimeGuardProtocol,
+]
 DpiProbe = Callable[[int], DpiDiagnosticsSnapshot]
 IntegrityProbe = Callable[[int], ProcessIntegritySnapshot]
 
@@ -151,6 +176,28 @@ def _default_capture_session_factory(
     )
 
 
+def _default_pointer_context_session_factory(
+    target: TargetWindowBinding,
+) -> PointerContextSession:
+    pointer_target = PointerContextTarget(
+        hwnd=target.hwnd,
+        process_id=target.process_id,
+        title=target.title,
+        client_region=Region(
+            left=target.client_left,
+            top=target.client_top,
+            width=target.client_width,
+            height=target.client_height,
+        ),
+        selected_at_monotonic_ns=target.selected_at_monotonic_ns,
+        process_started_at=target.process_started_at,
+    )
+    return PointerContextSession(
+        pointer_target,
+        Win32PointerSignalProvider(),
+    )
+
+
 def _default_execution_session_factory(
     plan: InputPlan,
     target: TargetWindowBinding,
@@ -169,7 +216,9 @@ def _default_plan_store() -> InputPlanStore:
     )
 
 
-def _default_target_binder(selected: WindowInfo) -> TargetWindowBinding:
+def _default_target_binder(
+    selected: InputWindowSelection,
+) -> TargetWindowBinding:
     if not is_window(selected.hwnd):
         raise RuntimeError("目标窗口句柄已失效，请刷新窗口列表")
     process_id = get_window_process_id(selected.hwnd)
@@ -178,6 +227,8 @@ def _default_target_binder(selected: WindowInfo) -> TargetWindowBinding:
     title = get_window_title(selected.hwnd).strip()
     if not title:
         raise RuntimeError("目标窗口标题已经不可用")
+    if is_window_minimized(selected.hwnd):
+        raise RuntimeError("目标窗口当前已最小化，请恢复后重试")
     region = get_window_region(selected.hwnd, WindowArea.CLIENT)
     if region.width <= 1 or region.height <= 1:
         raise RuntimeError("目标窗口客户区尺寸无效")
@@ -186,19 +237,19 @@ def _default_target_binder(selected: WindowInfo) -> TargetWindowBinding:
         title=title,
         process_id=process_id,
         client_region=region,
-        minimized=selected.minimized,
+        minimized=False,
     )
     return bind_window_info(fresh)
 
 
 def _default_pending_target_factory(
-    selected: WindowInfo,
+    selected: InputWindowSelection,
 ) -> PendingTargetResolver:
     return PendingTargetResolver(freeze_window_identity(selected))
 
 
 def _default_window_lifetime_factory(
-    selected: WindowInfo,
+    selected: InputWindowSelection,
 ) -> WindowLifetimeGuard:
     return WindowLifetimeGuard(
         selected.hwnd,
@@ -212,9 +263,12 @@ class InputExecutionLabWindow(QMainWindow):
     def __init__(
         self,
         *,
-        window_provider: WindowProvider = list_windows,
+        window_provider: WindowProvider = list_input_window_candidates,
         capture_session_factory: CaptureSessionFactory = (
             _default_capture_session_factory
+        ),
+        pointer_context_session_factory: PointerContextSessionFactory = (
+            _default_pointer_context_session_factory
         ),
         execution_session_factory: ExecutionSessionFactory = (
             _default_execution_session_factory
@@ -244,6 +298,7 @@ class InputExecutionLabWindow(QMainWindow):
 
         self._window_provider = window_provider
         self._capture_session_factory = capture_session_factory
+        self._pointer_context_session_factory = pointer_context_session_factory
         self._execution_session_factory = execution_session_factory
         self._emergency_stop_factory = emergency_stop_factory
         self._plan_store = plan_store or _default_plan_store()
@@ -256,6 +311,13 @@ class InputExecutionLabWindow(QMainWindow):
 
         self._capture_session: InputCaptureSession | None = None
         self._capture_events: list[InputCaptureEvent] = []
+        self._recording_pointer_context_session: PointerContextSession | None = None
+        self._capture_pointer_context_bindings: dict[
+            str,
+            RecordingPointerContextBinding,
+        ] = {}
+        self._last_pointer_context_state_key: tuple[object, ...] | None = None
+        self._last_pointer_context_error: str | None = None
         self._capture_was_active = False
         self._capture_active_started_at_ns: int | None = None
         self._capture_finalized = True
@@ -546,13 +608,18 @@ class InputExecutionLabWindow(QMainWindow):
         if self._is_busy():
             return
         previous = self.window_combo.currentData()
-        previous_hwnd = previous.hwnd if isinstance(previous, WindowInfo) else None
+        previous_hwnd = previous.hwnd if is_input_window_selection(previous) else None
         try:
             windows = tuple(
                 self._window_provider(
                     exclude_process_id=int(self._process_id_provider())
                 )
             )
+            if any(not is_input_window_selection(window) for window in windows):
+                raise TypeError(
+                    "window_provider must return WindowInfo or "
+                    "InputWindowCandidate values"
+                )
         except Exception as exc:
             self.window_combo.clear()
             self._selected_integrity_snapshot = None
@@ -589,13 +656,17 @@ class InputExecutionLabWindow(QMainWindow):
         self._reported_session_id = None
         self._last_execution_status = None
         self._overlay.hide_message()
-        if isinstance(selected, WindowInfo):
+        if is_input_window_selection(selected):
             self._refresh_integrity_gate(selected.process_id)
             minimized = " · 刷新时已最小化" if selected.minimized else ""
+            region = selected.client_region
+            geometry = (
+                f"{region.width}×{region.height}" if region is not None else "待恢复"
+            )
             self.target_label.setText(
                 f"当前候选：{selected.title} · PID {selected.process_id} · "
                 f"{hex(selected.hwnd)} · 刷新时客户区 "
-                f"{selected.client_region.width}×{selected.client_region.height}"
+                f"{geometry}"
                 f"{minimized}；尚未冻结为本次目标"
             )
         else:
@@ -1261,15 +1332,39 @@ class InputExecutionLabWindow(QMainWindow):
             return
         if not self._confirm_discard_draft("开始录制并在成功后替换当前草稿"):
             return
+        session: InputCaptureSession | None = None
+        pointer_session: PointerContextSession | None = None
         try:
             target = self._bind_selected_window()
+            pointer_session = self._pointer_context_session_factory(target)
+            pointer_target = pointer_session.target
+            if (
+                pointer_target.hwnd != target.hwnd
+                or pointer_target.process_id != target.process_id
+            ):
+                raise RuntimeError("指针上下文会话绑定了错误的目标身份")
             session = self._capture_session_factory(target)
             session.start()
         except Exception as exc:
+            if session is not None:
+                try:
+                    session.stop()
+                except Exception:
+                    pass
+            if pointer_session is not None:
+                try:
+                    pointer_session.close()
+                except Exception:
+                    pass
             QMessageBox.warning(self, "无法开始录制", str(exc))
             return
+        self._close_recording_pointer_context_session()
         self._capture_session = session
+        self._recording_pointer_context_session = pointer_session
         self._capture_events = []
+        self._capture_pointer_context_bindings = {}
+        self._last_pointer_context_state_key = None
+        self._last_pointer_context_error = None
         self._capture_was_active = False
         self._capture_active_started_at_ns = None
         self._capture_finalized = False
@@ -1287,6 +1382,7 @@ class InputExecutionLabWindow(QMainWindow):
         self.mode_label.setText("模式：等待目标窗口前台，随后录制倒计时")
         self._append_capture_diagnostics(session)
         if session.state is InputCaptureSessionState.FAILED:
+            self._close_recording_pointer_context_session()
             self._capture_finalized = True
             self.mode_label.setText("模式：录制监听启动失败")
             self.report_label.setText(
@@ -1316,7 +1412,7 @@ class InputExecutionLabWindow(QMainWindow):
         if plan is None:
             return
         selected = self.window_combo.currentData()
-        if not isinstance(selected, WindowInfo):
+        if not is_input_window_selection(selected):
             QMessageBox.warning(self, "无法开始执行", "请先选择目标窗口")
             return
         lifetime_guard: WindowLifetimeGuardProtocol | None = None
@@ -1564,7 +1660,7 @@ class InputExecutionLabWindow(QMainWindow):
 
     def _bind_selected_window(self) -> TargetWindowBinding:
         selected = self.window_combo.currentData()
-        if not isinstance(selected, WindowInfo):
+        if not is_input_window_selection(selected):
             raise RuntimeError("请先选择目标窗口")
         return self._target_binder(selected)
 
@@ -1676,9 +1772,9 @@ class InputExecutionLabWindow(QMainWindow):
         if session is None:
             return
         self._append_capture_diagnostics(session)
-        self._drain_capture_events(session)
         if session.state is InputCaptureSessionState.RUNNING:
             snapshot = session.refresh_gate()
+            self._sample_recording_pointer_context(snapshot)
             self._append_capture_diagnostics(session)
             self._update_capture_gate(snapshot)
             if snapshot.focus_epoch > 0:
@@ -1700,6 +1796,7 @@ class InputExecutionLabWindow(QMainWindow):
                 self._capture_stop_reason = "录制中目标窗口失去精确前台"
                 session.stop()
                 self._overlay.hide_message()
+        self._drain_capture_events(session)
         if session.state is not InputCaptureSessionState.RUNNING:
             self._cancel_capture_timeout()
         self._drain_capture_events(session)
@@ -1780,6 +1877,7 @@ class InputExecutionLabWindow(QMainWindow):
                         sort_keys=True,
                     )
                 )
+                self._bind_recorded_mouse_event(event)
             if len(self._capture_events) >= _MAX_CAPTURE_EVENTS:
                 if session.state is InputCaptureSessionState.RUNNING:
                     self._capture_stop_reason = (
@@ -1794,6 +1892,7 @@ class InputExecutionLabWindow(QMainWindow):
         self._cancel_capture_timeout()
         self._overlay.hide_message()
         self._append_capture_diagnostics(session)
+        self._close_recording_pointer_context_session()
         if not self._capture_events:
             self.mode_label.setText(
                 f"模式：录制结束，未接纳事件。{self._capture_stop_reason}"
@@ -1808,6 +1907,7 @@ class InputExecutionLabWindow(QMainWindow):
                 plan_id=f"recorded-{uuid.uuid4().hex}",
                 name=f"录制方案 {datetime.now():%Y-%m-%d %H-%M-%S}",
                 timeline_has_gap=session.has_timeline_gap,
+                pointer_context_bindings=(self._capture_pointer_context_bindings),
             )
         except RecordingCompileError as exc:
             self.mode_label.setText(f"模式：录制无法形成安全方案：{exc}")
@@ -1829,6 +1929,152 @@ class InputExecutionLabWindow(QMainWindow):
         self.mode_label.setText(
             f"模式：录制结束，已生成 {len(plan.events)} 个原子事件草稿"
         )
+
+    def _sample_recording_pointer_context(
+        self,
+        gate_snapshot: FocusGateSnapshot,
+    ) -> None:
+        session = self._recording_pointer_context_session
+        if session is None:
+            return
+        focus_epoch = gate_snapshot.focus_epoch
+        if gate_snapshot.state is FocusGateState.ARMING:
+            focus_epoch += 1
+        try:
+            snapshot = session.sample(focus_epoch=focus_epoch)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if error != self._last_pointer_context_error:
+                self.capture_diagnostics_detail.appendPlainText(
+                    json.dumps(
+                        {
+                            "kind": "pointer_context_error",
+                            "capture_session_id": getattr(
+                                self._capture_session,
+                                "session_id",
+                                None,
+                            ),
+                            "error": error,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                self._last_pointer_context_error = error
+            self._last_pointer_context_state_key = None
+            return
+
+        recovered = self._last_pointer_context_error is not None
+        self._last_pointer_context_error = None
+        if recovered:
+            self.capture_diagnostics_detail.appendPlainText(
+                json.dumps(
+                    {
+                        "kind": "pointer_context_recovered",
+                        "capture_session_id": getattr(
+                            self._capture_session,
+                            "session_id",
+                            None,
+                        ),
+                        "pointer_session_id": snapshot.session_id,
+                        "sequence": snapshot.sequence,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        key = (
+            snapshot.focus_epoch,
+            snapshot.candidate,
+            snapshot.raw_candidate,
+            snapshot.is_stable,
+            snapshot.reasons,
+        )
+        if key == self._last_pointer_context_state_key:
+            return
+        self._last_pointer_context_state_key = key
+        payload = snapshot.to_dict()
+        payload["kind"] = "pointer_context_state"
+        payload["capture_session_id"] = getattr(
+            self._capture_session,
+            "session_id",
+            None,
+        )
+        self.capture_diagnostics_detail.appendPlainText(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+    def _bind_recorded_mouse_event(self, event: InputCaptureEvent) -> None:
+        if event.device is not InputDevice.MOUSE:
+            return
+        session = self._recording_pointer_context_session
+        if session is None:
+            self.capture_diagnostics_detail.appendPlainText(
+                json.dumps(
+                    {
+                        "kind": "pointer_context_binding_error",
+                        "input_event_id": event.input_event_id,
+                        "error": "pointer context session is unavailable",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return
+        try:
+            binding = bind_capture_event_to_pointer_context(
+                event,
+                session.history,
+            )
+        except Exception as exc:
+            self.capture_diagnostics_detail.appendPlainText(
+                json.dumps(
+                    {
+                        "kind": "pointer_context_binding_error",
+                        "input_event_id": event.input_event_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return
+        self._capture_pointer_context_bindings[event.input_event_id] = binding
+        self.capture_diagnostics_detail.appendPlainText(
+            json.dumps(
+                binding.to_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+    def _close_recording_pointer_context_session(self) -> None:
+        session = self._recording_pointer_context_session
+        self._recording_pointer_context_session = None
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception as exc:
+            self.capture_diagnostics_detail.appendPlainText(
+                json.dumps(
+                    {
+                        "kind": "pointer_context_close_error",
+                        "pointer_session_id": getattr(
+                            session,
+                            "session_id",
+                            None,
+                        ),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
 
     def _append_capture_diagnostics(
         self,
@@ -2391,7 +2637,7 @@ class InputExecutionLabWindow(QMainWindow):
         execution_busy = self._is_execution_busy()
         busy = capture_busy or execution_busy
         selected_window = self.window_combo.currentData()
-        has_window = isinstance(selected_window, WindowInfo)
+        has_window = is_input_window_selection(selected_window)
         has_plan = self.current_plan is not None
         has_selection = bool(self.plan_table.selectionModel().selectedRows())
         active_track = self._active_track()
@@ -2404,7 +2650,7 @@ class InputExecutionLabWindow(QMainWindow):
             and getattr(session, "has_unreleased_inputs", False)
         )
         integrity_ready = bool(
-            isinstance(selected_window, WindowInfo)
+            is_input_window_selection(selected_window)
             and self._selected_integrity_snapshot is not None
             and self._selected_integrity_snapshot.target_process_id
             == selected_window.process_id
@@ -2515,6 +2761,7 @@ class InputExecutionLabWindow(QMainWindow):
             return
         self._poll_timer.stop()
         self._cancel_capture_timeout()
+        self._close_recording_pointer_context_session()
         self._stop_emergency_listener()
         self._stop_window_lifetime_guard()
         self._overlay.close()
@@ -2637,7 +2884,7 @@ def run(*, smoke_test: bool = False) -> int:
         app = QApplication([])
     app.setFont(QFont("Microsoft YaHei UI", 10))
     window_provider: WindowProvider = (
-        (lambda **_kwargs: ()) if smoke_test else list_windows
+        (lambda **_kwargs: ()) if smoke_test else list_input_window_candidates
     )
     window = InputExecutionLabWindow(window_provider=window_provider)
     _ACTIVE_WINDOWS.add(window)

@@ -1,0 +1,2 @@
+# Control Overlay Lab experimental environment (Python 3.12, Windows 11)
+PySide6-Essentials>=6.8,<7

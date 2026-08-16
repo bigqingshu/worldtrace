@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from experiments.capture_backends.contracts import Region
 from experiments.pointer_context_lab.contracts import (
@@ -117,6 +118,18 @@ class PointerContextContractTests(unittest.TestCase):
                 observed_at_monotonic_ns=1,
                 clip_rect_available=True,
             )
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            PointerContextSignals(
+                observed_at_monotonic_ns=1,
+                clip_rect_available=True,
+                clip_rect=DESKTOP_REGION,
+                clip_point=(100, 200),
+            )
+        with self.assertRaisesRegex(ValueError, "clip_rect_available"):
+            PointerContextSignals(
+                observed_at_monotonic_ns=1,
+                clip_point=(100, 200),
+            )
         with self.assertRaisesRegex(ValueError, "virtual_desktop_rect"):
             PointerContextSignals(
                 observed_at_monotonic_ns=1,
@@ -145,7 +158,61 @@ class PointerContextContractTests(unittest.TestCase):
         self.assertEqual(payload["candidate"], "POSITIONED_UI_CANDIDATE")
         self.assertEqual(payload["stability"]["state"], "STABLE")
         self.assertEqual(payload["signals"]["gui_thread"]["capture_hwnd"], None)
+        self.assertEqual(
+            payload["geometry"]["delta"],
+            {"left": 0, "top": 0, "width": 0, "height": 0},
+        )
+        self.assertFalse(payload["geometry"]["position_changed"])
+        self.assertFalse(payload["geometry"]["size_changed"])
+        self.assertEqual(payload["signals"]["clip"]["shape"], "RECTANGLE")
+        self.assertIsNone(payload["signals"]["clip"]["point"])
         json.dumps(payload, ensure_ascii=False)
+
+    def test_point_clip_is_json_safe_and_distinct_from_an_unavailable_clip(
+        self,
+    ) -> None:
+        point_clip = replace(
+            _signals(),
+            clip_rect=None,
+            clip_point=(201, 301),
+        )
+
+        payload = point_clip.to_dict()
+
+        self.assertTrue(payload["clip"]["available"])
+        self.assertEqual(payload["clip"]["shape"], "POINT")
+        self.assertIsNone(payload["clip"]["rect"])
+        self.assertEqual(payload["clip"]["point"], [201, 301])
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_snapshot_reports_position_and_size_delta(self) -> None:
+        moved_and_resized = replace(
+            _signals(),
+            target_client_region=Region(left=112, top=195, width=820, height=590),
+        )
+        snapshot = PointerContextSnapshot(
+            session_id="session-1",
+            sequence=1,
+            target=_target(),
+            focus_epoch=1,
+            candidate=PointerContextCandidate.UNKNOWN,
+            raw_candidate=PointerContextCandidate.UNKNOWN,
+            reasons=(PointerContextReasonCode.TARGET_GEOMETRY_CHANGED,),
+            signals=moved_and_resized,
+            stability_started_at_monotonic_ns=1_000,
+            stable_for_ns=0,
+            stable_sample_count=0,
+            required_stability_ns=150_000_000,
+        )
+
+        geometry = snapshot.to_dict()["geometry"]
+
+        self.assertEqual(
+            geometry["delta"],
+            {"left": 12, "top": -5, "width": 20, "height": -10},
+        )
+        self.assertTrue(geometry["position_changed"])
+        self.assertTrue(geometry["size_changed"])
 
     def test_decision_and_snapshot_reject_non_enum_reasons(self) -> None:
         with self.assertRaises(TypeError):

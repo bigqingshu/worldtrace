@@ -18,6 +18,11 @@ from experiments.input_execution_lab.recording import (
     RecordingCompileError,
     compile_capture_events,
 )
+from experiments.input_execution_lab.recording_pointer_context import (
+    RecordingPointerContextBinding,
+    RecordingPointerContextBindingStatus,
+)
+from experiments.pointer_context_lab import PointerContextCandidate
 
 
 _SESSION_START_NS = 1_000_000_000
@@ -74,12 +79,49 @@ def _capture(
 
 def _compile(events: list[InputCaptureEvent], **kwargs: object):
     kwargs.setdefault("timeline_has_gap", False)
+    kwargs.setdefault(
+        "pointer_context_bindings",
+        {
+            event.input_event_id: _binding(event)
+            for event in events
+            if isinstance(event, InputCaptureEvent)
+            and event.device is InputDevice.MOUSE
+        },
+    )
     return compile_capture_events(
         events,
         plan_id="recorded-plan",
         name="录制方案",
         now_utc="2026-07-28T10:00:00.000Z",
         **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _binding(
+    event: InputCaptureEvent,
+    *,
+    candidate: PointerContextCandidate = (
+        PointerContextCandidate.POSITIONED_UI_CANDIDATE
+    ),
+    status: RecordingPointerContextBindingStatus = (
+        RecordingPointerContextBindingStatus.BOUND
+    ),
+    pointer_session_id: str = "pointer-session",
+) -> RecordingPointerContextBinding:
+    bound = status is RecordingPointerContextBindingStatus.BOUND
+    return RecordingPointerContextBinding(
+        input_event_id=event.input_event_id,
+        capture_session_id=event.session_id,
+        captured_at_monotonic_ns=event.captured_at_monotonic_ns,
+        status=status,
+        pointer_session_id=pointer_session_id if bound else None,
+        pointer_snapshot_sequence=event.sequence if bound else None,
+        observed_at_monotonic_ns=(event.captured_at_monotonic_ns if bound else None),
+        age_ns=0 if bound else None,
+        candidate=candidate if bound else None,
+        raw_candidate=candidate if bound else None,
+        pointer_focus_epoch=event.focus_epoch if bound else None,
+        stable=bound,
     )
 
 
@@ -189,6 +231,125 @@ class CompileCaptureEventsTests(unittest.TestCase):
             InputPlanEventType.MOUSE_MOVE_RELATIVE,
             {event.event_type for event in plan.events},
         )
+
+    def test_compiles_stable_locked_mouse_buttons_as_direct_events(self) -> None:
+        down_at = _SESSION_START_NS + 10_000_000
+        up_at = down_at + 80_000_000
+        events = [
+            _capture(
+                1,
+                InputEventType.MOUSE_BUTTON_DOWN,
+                at_ns=down_at,
+                group_id="mouse-group",
+                key_or_button="left",
+            ),
+            _capture(
+                2,
+                InputEventType.MOUSE_BUTTON_UP,
+                at_ns=up_at,
+                group_id="mouse-group",
+                key_or_button="left",
+                press_duration_ns=up_at - down_at,
+            ),
+        ]
+        bindings = {
+            event.input_event_id: _binding(
+                event,
+                candidate=(PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE),
+            )
+            for event in events
+        }
+
+        plan = _compile(events, pointer_context_bindings=bindings)
+
+        self.assertEqual(
+            tuple(event.event_type for event in plan.events),
+            (
+                InputPlanEventType.MOUSE_BUTTON_DOWN_DIRECT,
+                InputPlanEventType.MOUSE_BUTTON_UP_DIRECT,
+            ),
+        )
+        self.assertEqual(plan.events[0].button, MouseButton.LEFT)
+        self.assertIsNone(plan.events[0].position)
+        self.assertIsNone(plan.events[1].position)
+
+    def test_rejects_missing_unusable_or_changed_mouse_context(self) -> None:
+        down_at = _SESSION_START_NS + 10_000_000
+        up_at = down_at + 80_000_000
+        events = [
+            _capture(
+                1,
+                InputEventType.MOUSE_BUTTON_DOWN,
+                at_ns=down_at,
+                group_id="mouse-group",
+                key_or_button="left",
+            ),
+            _capture(
+                2,
+                InputEventType.MOUSE_BUTTON_UP,
+                at_ns=up_at,
+                group_id="mouse-group",
+                key_or_button="left",
+                press_duration_ns=up_at - down_at,
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            RecordingCompileError,
+            "has no pointer context binding",
+        ):
+            _compile(events, pointer_context_bindings={})
+
+        unusable = {
+            events[0].input_event_id: _binding(
+                events[0],
+                status=RecordingPointerContextBindingStatus.NO_PRIOR_SNAPSHOT,
+            ),
+            events[1].input_event_id: _binding(events[1]),
+        }
+        with self.assertRaisesRegex(
+            RecordingCompileError,
+            "NO_PRIOR_SNAPSHOT",
+        ):
+            _compile(events, pointer_context_bindings=unusable)
+
+        changed = {
+            events[0].input_event_id: _binding(events[0]),
+            events[1].input_event_id: _binding(
+                events[1],
+                candidate=(PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE),
+            ),
+        }
+        with self.assertRaisesRegex(
+            RecordingCompileError,
+            "changes pointer context",
+        ):
+            _compile(events, pointer_context_bindings=changed)
+
+    def test_rejects_locked_context_wheel_without_inventing_direct_wheel(
+        self,
+    ) -> None:
+        event = _capture(
+            1,
+            InputEventType.MOUSE_WHEEL,
+            at_ns=_SESSION_START_NS + 10_000_000,
+            group_id="wheel",
+            key_or_button="wheel",
+            wheel_delta=(0, 1),
+        )
+        binding = _binding(
+            event,
+            candidate=PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE,
+        )
+
+        with self.assertRaisesRegex(
+            RecordingCompileError,
+            "direct wheel is not represented",
+        ):
+            _compile(
+                [event],
+                pointer_context_bindings={event.input_event_id: binding},
+            )
 
     def test_overlapping_actions_keep_one_persistent_track_and_source_order(
         self,

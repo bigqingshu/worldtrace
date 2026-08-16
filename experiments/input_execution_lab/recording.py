@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from experiments.input_capture_lab.contracts import (
     InputCaptureEvent,
     InputDevice,
     InputEventType,
 )
+from experiments.pointer_context_lab import PointerContextCandidate
 
 from .contracts import (
     DEFAULT_INPUT_TRACK_ID,
@@ -21,6 +22,9 @@ from .contracts import (
     PlanValidationError,
     utc_now_iso,
     validate_plan,
+)
+from .recording_pointer_context import (
+    RecordingPointerContextBinding,
 )
 
 
@@ -63,6 +67,11 @@ def compile_capture_events(
     revision: int = 1,
     safety_limits: InputPlanSafetyLimits | None = None,
     timeline_has_gap: bool,
+    pointer_context_bindings: Mapping[
+        str,
+        RecordingPointerContextBinding,
+    ]
+    | None = None,
     now_utc: str | None = None,
 ) -> InputPlan:
     """Compile one complete capture epoch into an immutable recorded draft.
@@ -85,6 +94,8 @@ def compile_capture_events(
 
     _validate_timeline_identity(captured)
     _validate_press_pairs(captured)
+    bindings = {} if pointer_context_bindings is None else pointer_context_bindings
+    _validate_pointer_context_bindings(captured, bindings)
 
     first_timestamp_ns = captured[0].captured_at_monotonic_ns
     compiled = tuple(
@@ -93,6 +104,7 @@ def compile_capture_events(
             offset_ms=(event.captured_at_monotonic_ns - first_timestamp_ns)
             // 1_000_000,
             track_id=DEFAULT_INPUT_TRACK_ID,
+            pointer_context_binding=bindings.get(event.input_event_id),
         )
         for event in captured
     )
@@ -127,6 +139,11 @@ def compile_recorded_events(
     revision: int = 1,
     safety_limits: InputPlanSafetyLimits | None = None,
     timeline_has_gap: bool,
+    pointer_context_bindings: Mapping[
+        str,
+        RecordingPointerContextBinding,
+    ]
+    | None = None,
     now_utc: str | None = None,
 ) -> InputPlan:
     """Compatibility alias with an explicit recorded-input name."""
@@ -138,6 +155,7 @@ def compile_recorded_events(
         revision=revision,
         safety_limits=safety_limits,
         timeline_has_gap=timeline_has_gap,
+        pointer_context_bindings=pointer_context_bindings,
         now_utc=now_utc,
     )
 
@@ -234,11 +252,83 @@ def _validate_pair(
         raise RecordingCompileError("paired release duration is inconsistent")
 
 
+def _validate_pointer_context_bindings(
+    events: tuple[InputCaptureEvent, ...],
+    bindings: Mapping[str, RecordingPointerContextBinding],
+) -> None:
+    if not isinstance(bindings, Mapping):
+        raise TypeError("pointer_context_bindings must be a mapping")
+    for event_id, binding in bindings.items():
+        if not isinstance(event_id, str) or not event_id:
+            raise TypeError("pointer context binding keys must be event IDs")
+        if not isinstance(binding, RecordingPointerContextBinding):
+            raise TypeError(
+                "pointer_context_bindings values must be "
+                "RecordingPointerContextBinding values"
+            )
+
+    open_mouse_groups: dict[str, RecordingPointerContextBinding] = {}
+    for event in events:
+        if event.device is not InputDevice.MOUSE:
+            continue
+        binding = _require_pointer_context_binding(event, bindings)
+        if event.event_type is InputEventType.MOUSE_WHEEL:
+            if binding.candidate is not PointerContextCandidate.POSITIONED_UI_CANDIDATE:
+                raise RecordingCompileError(
+                    "captured wheel event requires stable positioned UI context; "
+                    "locked-context direct wheel is not represented"
+                )
+            continue
+        if event.event_type is InputEventType.MOUSE_BUTTON_DOWN:
+            open_mouse_groups[event.input_group_id] = binding
+            continue
+        if event.event_type is not InputEventType.MOUSE_BUTTON_UP:
+            continue
+        pressed = open_mouse_groups.pop(event.input_group_id, None)
+        if pressed is None:
+            continue
+        if (
+            pressed.candidate is not binding.candidate
+            or pressed.pointer_session_id != binding.pointer_session_id
+        ):
+            raise RecordingCompileError(
+                "captured mouse press changes pointer context before release"
+            )
+
+
+def _require_pointer_context_binding(
+    event: InputCaptureEvent,
+    bindings: Mapping[str, RecordingPointerContextBinding],
+) -> RecordingPointerContextBinding:
+    binding = bindings.get(event.input_event_id)
+    if binding is None:
+        raise RecordingCompileError(
+            f"captured mouse event {event.input_event_id} has no pointer "
+            "context binding"
+        )
+    if (
+        binding.input_event_id != event.input_event_id
+        or binding.capture_session_id != event.session_id
+        or binding.captured_at_monotonic_ns != event.captured_at_monotonic_ns
+    ):
+        raise RecordingCompileError(
+            f"captured mouse event {event.input_event_id} has a mismatched "
+            "pointer context binding"
+        )
+    if not binding.is_usable:
+        raise RecordingCompileError(
+            f"captured mouse event {event.input_event_id} has unusable "
+            f"pointer context: {binding.status.value}"
+        )
+    return binding
+
+
 def _compile_event(
     event: InputCaptureEvent,
     *,
     offset_ms: int,
     track_id: str,
+    pointer_context_binding: RecordingPointerContextBinding | None,
 ) -> InputPlanEvent:
     try:
         event_type = _CAPTURE_TO_PLAN_EVENT[event.event_type]
@@ -269,6 +359,27 @@ def _compile_event(
         InputEventType.MOUSE_BUTTON_DOWN,
         InputEventType.MOUSE_BUTTON_UP,
     }:
+        if pointer_context_binding is None:
+            raise RecordingCompileError(
+                f"captured mouse event {event.input_event_id} has no pointer "
+                "context binding"
+            )
+        if (
+            pointer_context_binding.candidate
+            is PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE
+        ):
+            direct_type = {
+                InputEventType.MOUSE_BUTTON_DOWN: (
+                    InputPlanEventType.MOUSE_BUTTON_DOWN_DIRECT
+                ),
+                InputEventType.MOUSE_BUTTON_UP: (
+                    InputPlanEventType.MOUSE_BUTTON_UP_DIRECT
+                ),
+            }[event.event_type]
+            return InputPlanEvent(
+                **(common | {"event_type": direct_type}),
+                button=_mouse_button(event.key_or_button),
+            )
         return InputPlanEvent(
             **common,
             button=_mouse_button(event.key_or_button),

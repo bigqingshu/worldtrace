@@ -29,10 +29,19 @@ from .pending_target import (
     freeze_window_identity,
 )
 from .plan_store import InputPlanStore
+from .recording_pointer_context import (
+    RecordingPointerContextBinding,
+    RecordingPointerContextBindingStatus,
+    bind_capture_event_to_pointer_context,
+)
 from .window_lifetime import (
     WindowLifetimeGuard,
     WindowLifetimeSnapshot,
     WindowLifetimeState,
+)
+from .window_candidate import (
+    InputWindowCandidate,
+    list_input_window_candidates,
 )
 
 __all__ = [
@@ -49,6 +58,7 @@ __all__ = [
     "InputPlanSafetyLimits",
     "InputPlanSource",
     "InputTrack",
+    "InputWindowCandidate",
     "InputPlanStore",
     "MouseButton",
     "MouseInterpolation",
@@ -56,11 +66,15 @@ __all__ = [
     "PendingTargetSnapshot",
     "PendingTargetState",
     "PlanValidationError",
+    "RecordingPointerContextBinding",
+    "RecordingPointerContextBindingStatus",
     "TargetWindowIdentity",
     "WindowLifetimeGuard",
     "WindowLifetimeSnapshot",
     "WindowLifetimeState",
     "compile_plan_schedule",
+    "bind_capture_event_to_pointer_context",
     "freeze_window_identity",
+    "list_input_window_candidates",
     "validate_plan",
 ]

@@ -409,11 +409,40 @@ class PointerContextNativeProbeTests(unittest.TestCase):
         self.assertEqual(signals.cursor_position, api.point)
         self.assertTrue(any("GetCursorInfo" in error for error in signals.errors))
 
-    def test_signal_provider_rejects_an_invalid_native_clip_rect_without_crashing(
+    def test_signal_provider_preserves_a_point_clip_without_reporting_an_error(
         self,
     ) -> None:
         api = _FakeWin32PointerApi()
-        api.clip = NativeRect(0, 0, 0, 0)
+        api.clip = NativeRect(321, 241, 321, 241)
+        provider = Win32PointerSignalProvider(
+            native_api=api,
+            monotonic_ns_provider=lambda: 99_000_000,
+            process_started_at_provider=lambda _pid: 1234.5,
+        )
+        target = PointerContextTarget(
+            hwnd=100,
+            process_id=42,
+            title="Target",
+            client_region=Region(
+                left=100,
+                top=200,
+                width=1280,
+                height=720,
+            ),
+        )
+
+        signals = provider.observe(target)
+
+        self.assertTrue(signals.clip_rect_available)
+        self.assertIsNone(signals.clip_rect)
+        self.assertEqual(signals.clip_point, (321, 241))
+        self.assertFalse(any("GetClipCursor" in error for error in signals.errors))
+
+    def test_signal_provider_rejects_an_inconsistent_native_clip_rect(
+        self,
+    ) -> None:
+        api = _FakeWin32PointerApi()
+        api.clip = NativeRect(0, 0, 0, 100)
         provider = Win32PointerSignalProvider(
             native_api=api,
             monotonic_ns_provider=lambda: 99_000_000,
@@ -435,6 +464,7 @@ class PointerContextNativeProbeTests(unittest.TestCase):
 
         self.assertFalse(signals.clip_rect_available)
         self.assertIsNone(signals.clip_rect)
+        self.assertIsNone(signals.clip_point)
         self.assertTrue(any("GetClipCursor" in error for error in signals.errors))
 
 

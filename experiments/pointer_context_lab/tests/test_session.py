@@ -131,6 +131,48 @@ class PointerContextSessionTests(unittest.TestCase):
             changed.reasons,
         )
 
+    def test_position_only_change_restarts_stability_then_rebases(self) -> None:
+        start = 1_000_000_000
+        moved_region = Region(left=140, top=200, width=800, height=600)
+        moved = replace(
+            _signals(start + 300_000_000),
+            target_client_region=moved_region,
+            cursor_info_position=(240, 300),
+            cursor_position=(240, 300),
+        )
+        moved_stable = replace(
+            moved,
+            observed_at_monotonic_ns=start + 450_000_000,
+        )
+        provider = _Provider(
+            (
+                _signals(start),
+                _signals(start + 150_000_000),
+                moved,
+                moved_stable,
+            )
+        )
+        session = PointerContextSession(_target(), provider)
+        session.sample(focus_epoch=1)
+        self.assertTrue(session.sample(focus_epoch=1).is_stable)
+
+        changed = session.sample(focus_epoch=1)
+        stable_again = session.sample(focus_epoch=1)
+
+        self.assertFalse(changed.is_stable)
+        self.assertEqual(changed.stable_sample_count, 1)
+        self.assertEqual(changed.stable_for_ns, 0)
+        self.assertIn(
+            PointerContextReasonCode.TARGET_POSITION_CHANGED,
+            changed.reasons,
+        )
+        self.assertTrue(stable_again.is_stable)
+        self.assertEqual(stable_again.stable_for_ns, 150_000_000)
+        self.assertIn(
+            PointerContextReasonCode.TARGET_POSITION_CHANGED,
+            stable_again.reasons,
+        )
+
     def test_focus_loss_and_identity_failure_immediately_return_unknown(self) -> None:
         start = 1_000_000_000
         provider = _Provider(
@@ -182,7 +224,7 @@ class PointerContextSessionTests(unittest.TestCase):
             (
                 RuntimeError("probe unavailable"),
                 _signals(100),
-                _signals(100),
+                _signals(99),
             )
         )
         clock_values = iter((50, 101))
@@ -210,6 +252,38 @@ class PointerContextSessionTests(unittest.TestCase):
             PointerContextReasonCode.PROVIDER_ERROR,
             non_monotonic.reasons,
         )
+
+    def test_equal_provider_timestamps_are_ordered_without_becoming_errors(
+        self,
+    ) -> None:
+        provider = _Provider(
+            (
+                _signals(100),
+                _signals(100),
+                _signals(150_000_100),
+            )
+        )
+        session = PointerContextSession(
+            _target(),
+            provider,
+            clock=lambda: 101,
+        )
+
+        first = session.sample(focus_epoch=1)
+        duplicate = session.sample(focus_epoch=1)
+        stable = session.sample(focus_epoch=1)
+
+        self.assertEqual(duplicate.signals.observed_at_monotonic_ns, 101)
+        self.assertFalse(duplicate.signals.errors)
+        self.assertNotIn(
+            PointerContextReasonCode.PROVIDER_ERROR,
+            duplicate.reasons,
+        )
+        self.assertGreater(
+            duplicate.signals.observed_at_monotonic_ns,
+            first.signals.observed_at_monotonic_ns,
+        )
+        self.assertTrue(stable.is_stable)
 
     def test_history_is_bounded_and_volatile(self) -> None:
         provider = _Provider((_signals(100), _signals(200), _signals(300)))

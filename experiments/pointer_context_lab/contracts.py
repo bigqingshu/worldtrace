@@ -24,6 +24,7 @@ class PointerContextReasonCode(str, Enum):
     TARGET_IDENTITY_MISMATCH = "TARGET_IDENTITY_MISMATCH"
     TARGET_MINIMIZED = "TARGET_MINIMIZED"
     TARGET_GEOMETRY_CHANGED = "TARGET_GEOMETRY_CHANGED"
+    TARGET_POSITION_CHANGED = "TARGET_POSITION_CHANGED"
     TARGET_NOT_FOREGROUND = "TARGET_NOT_FOREGROUND"
     CURSOR_INFO_UNAVAILABLE = "CURSOR_INFO_UNAVAILABLE"
     CURSOR_POSITION_UNAVAILABLE = "CURSOR_POSITION_UNAVAILABLE"
@@ -37,6 +38,8 @@ class PointerContextReasonCode(str, Enum):
     CURSOR_OUTSIDE_TARGET = "CURSOR_OUTSIDE_TARGET"
     CLIP_MATCHES_DESKTOP = "CLIP_MATCHES_DESKTOP"
     CLIP_MATCHES_TARGET = "CLIP_MATCHES_TARGET"
+    CLIP_IS_POINT = "CLIP_IS_POINT"
+    CLIP_POINT_MATCHES_TARGET_CURSOR = "CLIP_POINT_MATCHES_TARGET_CURSOR"
     NO_CAPTURE = "NO_CAPTURE"
     TARGET_CAPTURE = "TARGET_CAPTURE"
     OTHER_CAPTURE = "OTHER_CAPTURE"
@@ -84,6 +87,33 @@ def _region_to_dict(region: Region | None) -> dict[str, int] | None:
 
 def _point_to_list(point: ScreenPoint | None) -> list[int] | None:
     return list(point) if point is not None else None
+
+
+def _geometry_comparison_to_dict(
+    selected: Region,
+    current: Region | None,
+) -> dict[str, object]:
+    if current is None:
+        return {
+            "selected_client_region": _region_to_dict(selected),
+            "current_client_region": None,
+            "delta": None,
+            "position_changed": None,
+            "size_changed": None,
+        }
+    delta = {
+        "left": current.left - selected.left,
+        "top": current.top - selected.top,
+        "width": current.width - selected.width,
+        "height": current.height - selected.height,
+    }
+    return {
+        "selected_client_region": _region_to_dict(selected),
+        "current_client_region": _region_to_dict(current),
+        "delta": delta,
+        "position_changed": bool(delta["left"] or delta["top"]),
+        "size_changed": bool(delta["width"] or delta["height"]),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +193,7 @@ class PointerContextSignals:
     cursor_position: ScreenPoint | None = None
     clip_rect_available: bool = False
     clip_rect: Region | None = None
+    clip_point: ScreenPoint | None = None
     virtual_desktop_available: bool = False
     virtual_desktop_rect: Region | None = None
     capture_info_available: bool = False
@@ -242,7 +273,7 @@ class PointerContextSignals:
             value = getattr(self, name)
             if value is not None and not isinstance(value, Region):
                 raise TypeError(f"{name} must be a Region or None")
-        for name in ("cursor_info_position", "cursor_position"):
+        for name in ("cursor_info_position", "cursor_position", "clip_point"):
             value = getattr(self, name)
             if value is not None and (
                 not isinstance(value, tuple)
@@ -261,8 +292,18 @@ class PointerContextSignals:
             raise ValueError(
                 "cursor_position is required when cursor_position_available is true"
             )
-        if self.clip_rect_available and self.clip_rect is None:
-            raise ValueError("clip_rect is required when clip_rect_available is true")
+        clip_value_count = int(self.clip_rect is not None) + int(
+            self.clip_point is not None
+        )
+        if self.clip_rect_available and clip_value_count != 1:
+            raise ValueError(
+                "exactly one of clip_rect or clip_point is required when "
+                "clip_rect_available is true"
+            )
+        if not self.clip_rect_available and clip_value_count:
+            raise ValueError(
+                "clip_rect and clip_point require clip_rect_available to be true"
+            )
         if self.virtual_desktop_available and self.virtual_desktop_rect is None:
             raise ValueError(
                 "virtual_desktop_rect is required when "
@@ -321,7 +362,15 @@ class PointerContextSignals:
             },
             "clip": {
                 "available": self.clip_rect_available,
+                "shape": (
+                    "RECTANGLE"
+                    if self.clip_rect is not None
+                    else "POINT"
+                    if self.clip_point is not None
+                    else None
+                ),
                 "rect": _region_to_dict(self.clip_rect),
+                "point": _point_to_list(self.clip_point),
                 "virtual_desktop_available": self.virtual_desktop_available,
                 "virtual_desktop_rect": _region_to_dict(self.virtual_desktop_rect),
             },
@@ -436,6 +485,10 @@ class PointerContextSnapshot:
             "raw_candidate": self.raw_candidate.value,
             "reasons": [reason.value for reason in self.reasons],
             "target": self.target.to_dict(),
+            "geometry": _geometry_comparison_to_dict(
+                self.target.client_region,
+                self.signals.target_client_region,
+            ),
             "stability": {
                 "state": "STABLE" if self.is_stable else "UNSTABLE",
                 "started_at_monotonic_ns": (self.stability_started_at_monotonic_ns),

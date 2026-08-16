@@ -10,7 +10,6 @@ from enum import Enum
 
 from experiments.capture_backends.contracts import Region, WindowArea
 from experiments.capture_backends.target_selector import (
-    WindowInfo,
     get_foreground_window_target,
     get_window_process_id,
     get_window_region,
@@ -18,6 +17,11 @@ from experiments.capture_backends.target_selector import (
     is_window,
 )
 from experiments.input_capture_lab.contracts import TargetWindowBinding
+
+from .window_candidate import (
+    InputWindowSelection,
+    is_input_window_selection,
+)
 
 
 _TARGET_WAIT_TIMEOUT_NS = 30_000_000_000
@@ -415,7 +419,7 @@ class PendingTargetResolver:
 
 
 def freeze_window_identity(
-    window: WindowInfo,
+    window: InputWindowSelection,
     *,
     clock: Clock = time.monotonic_ns,
     window_predicate: WindowPredicate = is_window,
@@ -425,8 +429,8 @@ def freeze_window_identity(
 ) -> TargetWindowIdentity:
     """Freeze identity without requiring a currently usable client rectangle."""
 
-    if not isinstance(window, WindowInfo):
-        raise TypeError("window must be a WindowInfo")
+    if not is_input_window_selection(window):
+        raise TypeError("window must be a WindowInfo or InputWindowCandidate")
     if not window_predicate(window.hwnd):
         raise RuntimeError("目标窗口句柄已失效，请刷新窗口列表")
     process_id = process_id_provider(window.hwnd)

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -166,6 +167,80 @@ def _stability_text(
     return state
 
 
+def _reason_text(payload: Mapping[str, object]) -> str:
+    reasons = payload.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return "—"
+    return "、".join(str(reason) for reason in reasons)
+
+
+def _geometry_text(payload: Mapping[str, object]) -> str:
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, Mapping):
+        return "UNKNOWN"
+    delta = geometry.get("delta")
+    if not isinstance(delta, Mapping):
+        return "UNKNOWN"
+    values = tuple(delta.get(name) for name in ("left", "top", "width", "height"))
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        return "UNKNOWN"
+    left, top, width, height = values
+    return f"Δx={left:+d}，Δy={top:+d}，Δwidth={width:+d}，Δheight={height:+d}"
+
+
+def _is_exact_target_foreground(
+    payload: Mapping[str, object],
+    target: PointerContextTarget,
+) -> bool:
+    signals = payload.get("signals")
+    if not isinstance(signals, Mapping):
+        return False
+    foreground = signals.get("foreground")
+    observed_target = signals.get("target")
+    if not isinstance(foreground, Mapping) or not isinstance(
+        observed_target,
+        Mapping,
+    ):
+        return False
+    identity_matches = (
+        foreground.get("available") is True
+        and foreground.get("hwnd") == target.hwnd
+        and foreground.get("process_id") == target.process_id
+        and observed_target.get("window_exists") is True
+        and observed_target.get("root_hwnd") == target.hwnd
+        and observed_target.get("current_process_id") == target.process_id
+        and observed_target.get("minimized") is False
+    )
+    if not identity_matches:
+        return False
+    if target.process_started_at is None:
+        return True
+    current_started_at = observed_target.get("current_process_started_at")
+    if isinstance(current_started_at, bool) or not isinstance(
+        current_started_at,
+        (int, float),
+    ):
+        return False
+    return abs(float(current_started_at) - target.process_started_at) <= 0.001
+
+
+def _payload_integer(
+    payload: Mapping[str, object],
+    key: str,
+) -> int | None:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _observed_at_ns(payload: Mapping[str, object]) -> int | None:
+    signals = payload.get("signals")
+    if not isinstance(signals, Mapping):
+        return None
+    return _payload_integer(signals, "observed_at_monotonic_ns")
+
+
 def _target_from_window(
     window: WindowInfo,
     *,
@@ -243,6 +318,8 @@ class PointerContextLabWindow(QMainWindow):
         self._signal_provider: object | None = None
         self._session: PointerContextSessionLike | None = None
         self._last_snapshot: PointerContextSnapshot | None = None
+        self._last_foreground_snapshot: PointerContextSnapshot | None = None
+        self._last_foreground_payload: dict[str, object] | None = None
         self._sample_count = 0
         self._running = False
 
@@ -260,6 +337,10 @@ class PointerContextLabWindow(QMainWindow):
     @property
     def last_snapshot(self) -> PointerContextSnapshot | None:
         return self._last_snapshot
+
+    @property
+    def last_foreground_snapshot(self) -> PointerContextSnapshot | None:
+        return self._last_foreground_snapshot
 
     @property
     def is_running(self) -> bool:
@@ -293,6 +374,14 @@ class PointerContextLabWindow(QMainWindow):
         self.candidate_label = QLabel("候选：UNKNOWN", state_group)
         self.stability_label = QLabel("稳定性：尚未采样", state_group)
         self.sample_label = QLabel("成功采样：0", state_group)
+        self.reasons_label = QLabel("原因：—", state_group)
+        self.reasons_label.setWordWrap(True)
+        self.geometry_label = QLabel("几何差值：尚未采样", state_group)
+        self.last_foreground_label = QLabel(
+            "最后目标前台：尚无有效快照",
+            state_group,
+        )
+        self.last_foreground_label.setWordWrap(True)
         self.target_label = QLabel("冻结目标：未选择", state_group)
         self.target_label.setWordWrap(True)
         self.status_label = QLabel("状态：未开始", state_group)
@@ -300,19 +389,42 @@ class PointerContextLabWindow(QMainWindow):
         state_layout.addWidget(self.candidate_label, 0, 0)
         state_layout.addWidget(self.stability_label, 0, 1)
         state_layout.addWidget(self.sample_label, 0, 2)
-        state_layout.addWidget(self.target_label, 1, 0, 1, 3)
-        state_layout.addWidget(self.status_label, 2, 0, 1, 3)
+        state_layout.addWidget(self.reasons_label, 1, 0, 1, 3)
+        state_layout.addWidget(self.geometry_label, 2, 0, 1, 2)
+        state_layout.addWidget(self.last_foreground_label, 2, 2)
+        state_layout.addWidget(self.target_label, 3, 0, 1, 3)
+        state_layout.addWidget(self.status_label, 4, 0, 1, 3)
         root.addWidget(state_group)
 
-        raw_group = QGroupBox("最新原始快照 JSON（进程内覆盖显示）", central)
+        raw_group = QGroupBox("只读快照 JSON（进程内覆盖显示）", central)
         raw_layout = QVBoxLayout(raw_group)
-        self.raw_json_edit = QPlainTextEdit(raw_group)
+        self.snapshot_tabs = QTabWidget(raw_group)
+        current_tab = QWidget(self.snapshot_tabs)
+        current_layout = QVBoxLayout(current_tab)
+        current_layout.setContentsMargins(4, 4, 4, 4)
+        self.raw_json_edit = QPlainTextEdit(current_tab)
         self.raw_json_edit.setReadOnly(True)
         self.raw_json_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.raw_json_edit.setPlaceholderText(
-            "开始轮询后显示最新快照；不会追加历史或写入文件。"
+            "开始轮询后显示当前快照；不会追加历史或写入文件。"
         )
-        raw_layout.addWidget(self.raw_json_edit)
+        current_layout.addWidget(self.raw_json_edit)
+        self.snapshot_tabs.addTab(current_tab, "当前快照")
+
+        foreground_tab = QWidget(self.snapshot_tabs)
+        foreground_layout = QVBoxLayout(foreground_tab)
+        foreground_layout.setContentsMargins(4, 4, 4, 4)
+        self.last_foreground_json_edit = QPlainTextEdit(foreground_tab)
+        self.last_foreground_json_edit.setReadOnly(True)
+        self.last_foreground_json_edit.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.NoWrap
+        )
+        self.last_foreground_json_edit.setPlaceholderText(
+            "目标窗口成为精确前台后，保留最后一份快照供切回本 GUI 查看。"
+        )
+        foreground_layout.addWidget(self.last_foreground_json_edit)
+        self.snapshot_tabs.addTab(foreground_tab, "最后目标前台快照")
+        raw_layout.addWidget(self.snapshot_tabs)
         root.addWidget(raw_group, 1)
 
         note_row = QHBoxLayout()
@@ -399,7 +511,11 @@ class PointerContextLabWindow(QMainWindow):
         self._signal_provider = signal_provider
         self._session = session
         self._last_snapshot = None
+        self._last_foreground_snapshot = None
+        self._last_foreground_payload = None
         self._sample_count = 0
+        self.last_foreground_json_edit.clear()
+        self.last_foreground_label.setText("最后目标前台：尚无有效快照")
         self._running = True
         self.target_label.setText(
             f"冻结目标：{target.title} · PID {target.process_id} · "
@@ -440,12 +556,21 @@ class PointerContextLabWindow(QMainWindow):
         self.candidate_label.setText(f"候选：{_candidate_text(snapshot, payload)}")
         self.stability_label.setText(f"稳定性：{_stability_text(snapshot, payload)}")
         self.sample_label.setText(f"成功采样：{self._sample_count}")
+        self.reasons_label.setText(f"原因：{_reason_text(payload)}")
+        self.geometry_label.setText(f"几何差值：{_geometry_text(payload)}")
         self.raw_json_edit.setPlainText(raw_json)
+        if _is_exact_target_foreground(payload, target):
+            self._last_foreground_snapshot = snapshot
+            self._last_foreground_payload = payload
+            self.last_foreground_json_edit.setPlainText(raw_json)
+        self._update_last_foreground_label(payload)
         self.status_label.setText("状态：只读轮询中；最新快照已覆盖显示")
 
     def _show_sample_error(self, exc: Exception) -> None:
         self.candidate_label.setText("候选：UNKNOWN")
         self.stability_label.setText("稳定性：UNKNOWN")
+        self.reasons_label.setText("原因：本次采样异常")
+        self.geometry_label.setText("几何差值：UNKNOWN")
         self.status_label.setText(
             f"状态：本次采样失败，将继续轮询：{type(exc).__name__}: {exc}"
         )
@@ -460,6 +585,27 @@ class PointerContextLabWindow(QMainWindow):
                 indent=2,
                 sort_keys=True,
             )
+        )
+
+    def _update_last_foreground_label(
+        self,
+        current_payload: Mapping[str, object],
+    ) -> None:
+        payload = self._last_foreground_payload
+        if payload is None:
+            self.last_foreground_label.setText("最后目标前台：尚无有效快照")
+            return
+        sequence = _payload_integer(payload, "sequence")
+        candidate = _display_value(payload.get("candidate"))
+        current_at_ns = _observed_at_ns(current_payload)
+        retained_at_ns = _observed_at_ns(payload)
+        age_text = ""
+        if current_at_ns is not None and retained_at_ns is not None:
+            age_ms = max(0, current_at_ns - retained_at_ns) / 1_000_000
+            age_text = f" · 距当前 {age_ms:.0f} ms"
+        sequence_text = str(sequence) if sequence is not None else "UNKNOWN"
+        self.last_foreground_label.setText(
+            f"最后目标前台：序号 {sequence_text} · {candidate}{age_text}"
         )
 
     def _stop(self) -> None:

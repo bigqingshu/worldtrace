@@ -135,6 +135,51 @@ class PointerContextClassifierTests(unittest.TestCase):
             decision.reasons,
         )
 
+    def test_hidden_pointer_with_matching_point_clip_is_locked_candidate(
+        self,
+    ) -> None:
+        signals = replace(
+            _signals(),
+            cursor_visible=False,
+            clip_rect=None,
+            clip_point=(201, 301),
+        )
+
+        decision = classify_pointer_context(_target(), signals)
+
+        self.assertIs(
+            decision.candidate,
+            PointerContextCandidate.LOCKED_RELATIVE_CANDIDATE,
+        )
+        self.assertIn(PointerContextReasonCode.CLIP_IS_POINT, decision.reasons)
+        self.assertIn(
+            PointerContextReasonCode.CLIP_POINT_MATCHES_TARGET_CURSOR,
+            decision.reasons,
+        )
+
+    def test_point_clip_away_from_cursor_is_preserved_but_insufficient(
+        self,
+    ) -> None:
+        signals = replace(
+            _signals(),
+            cursor_visible=False,
+            clip_rect=None,
+            clip_point=(700, 700),
+        )
+
+        decision = classify_pointer_context(_target(), signals)
+
+        self.assertIs(decision.candidate, PointerContextCandidate.UNKNOWN)
+        self.assertIn(PointerContextReasonCode.CLIP_IS_POINT, decision.reasons)
+        self.assertNotIn(
+            PointerContextReasonCode.CLIP_POINT_MATCHES_TARGET_CURSOR,
+            decision.reasons,
+        )
+        self.assertIn(
+            PointerContextReasonCode.INSUFFICIENT_SIGNALS,
+            decision.reasons,
+        )
+
     def test_visible_pointer_with_target_ownership_is_hybrid(self) -> None:
         signals = replace(_signals(), clip_rect=TARGET_REGION)
 
@@ -187,7 +232,7 @@ class PointerContextClassifierTests(unittest.TestCase):
             (
                 replace(
                     _signals(),
-                    target_client_region=Region(101, 200, 800, 600),
+                    target_client_region=Region(100, 200, 801, 600),
                 ),
                 PointerContextReasonCode.TARGET_GEOMETRY_CHANGED,
             ),
@@ -204,6 +249,77 @@ class PointerContextClassifierTests(unittest.TestCase):
                     PointerContextCandidate.UNKNOWN,
                 )
                 self.assertIn(expected_reason, decision.reasons)
+
+    def test_position_only_change_is_diagnostic_not_a_blocker(self) -> None:
+        signals = replace(
+            _signals(),
+            target_client_region=Region(592, 200, 800, 600),
+            cursor_info_position=(692, 300),
+            cursor_position=(692, 300),
+        )
+
+        decision = classify_pointer_context(_target(), signals)
+
+        self.assertIs(
+            decision.candidate,
+            PointerContextCandidate.POSITIONED_UI_CANDIDATE,
+        )
+        self.assertIn(
+            PointerContextReasonCode.TARGET_POSITION_CHANGED,
+            decision.reasons,
+        )
+        self.assertNotIn(
+            PointerContextReasonCode.TARGET_GEOMETRY_CHANGED,
+            decision.reasons,
+        )
+
+    def test_all_target_gate_failures_are_reported_together(self) -> None:
+        signals = replace(
+            _signals(),
+            target_client_region=Region(592, 200, 820, 600),
+            foreground_hwnd=0x9999,
+            foreground_process_id=9999,
+        )
+
+        decision = classify_pointer_context(_target(), signals)
+
+        self.assertIs(decision.candidate, PointerContextCandidate.UNKNOWN)
+        self.assertIn(
+            PointerContextReasonCode.TARGET_GEOMETRY_CHANGED,
+            decision.reasons,
+        )
+        self.assertIn(
+            PointerContextReasonCode.TARGET_POSITION_CHANGED,
+            decision.reasons,
+        )
+        self.assertIn(
+            PointerContextReasonCode.TARGET_NOT_FOREGROUND,
+            decision.reasons,
+        )
+
+    def test_position_change_and_focus_loss_are_reported_together(self) -> None:
+        signals = replace(
+            _signals(),
+            target_client_region=Region(592, 200, 800, 600),
+            foreground_hwnd=0x9999,
+            foreground_process_id=9999,
+        )
+
+        decision = classify_pointer_context(_target(), signals)
+
+        self.assertIs(decision.candidate, PointerContextCandidate.UNKNOWN)
+        self.assertIn(
+            PointerContextReasonCode.TARGET_POSITION_CHANGED,
+            decision.reasons,
+        )
+        self.assertIn(
+            PointerContextReasonCode.TARGET_NOT_FOREGROUND,
+            decision.reasons,
+        )
+        self.assertNotIn(
+            PointerContextReasonCode.TARGET_GEOMETRY_CHANGED,
+            decision.reasons,
+        )
 
     def test_small_region_difference_is_tolerated(self) -> None:
         signals = replace(

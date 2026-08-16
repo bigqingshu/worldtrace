@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import replace
 from typing import Callable
 
+from experiments.capture_backends.contracts import Region
+
 from .classifier import classify_pointer_context
 from .contracts import (
     PointerContextCandidate,
@@ -68,6 +70,7 @@ class PointerContextSession:
         self._stability_started_at_ns: int | None = None
         self._stable_sample_count = 0
         self._focus_epoch: int | None = None
+        self._last_target_client_region: Region | None = None
         self._closed = False
         self._lock = threading.RLock()
 
@@ -112,16 +115,20 @@ class PointerContextSession:
             signals = self._observe_locked()
             signals, non_monotonic = self._normalize_timestamp_locked(signals)
             decision = self._decision_locked(signals, focus_epoch)
+            target_position_changed = self._target_position_changed_locked(signals)
             candidate, started_at_ns, stable_for_ns, sample_count, extra = (
                 self._stabilize_locked(
                     decision.candidate,
                     focus_epoch=focus_epoch,
                     observed_at_ns=signals.observed_at_monotonic_ns,
+                    reset_for_target_position=target_position_changed,
                 )
             )
             reasons = list(decision.reasons)
             if non_monotonic:
                 reasons.append(PointerContextReasonCode.PROVIDER_ERROR)
+            if target_position_changed:
+                reasons.append(PointerContextReasonCode.TARGET_POSITION_CHANGED)
             reasons.extend(extra)
             self._sequence += 1
             snapshot = PointerContextSnapshot(
@@ -140,6 +147,8 @@ class PointerContextSession:
             )
             self._history.append(snapshot)
             self._last_observed_at_ns = signals.observed_at_monotonic_ns
+            if signals.target_client_region is not None:
+                self._last_target_client_region = signals.target_client_region
             return snapshot
 
     def close(self) -> None:
@@ -184,10 +193,21 @@ class PointerContextSession:
         previous = self._last_observed_at_ns
         if previous is None or signals.observed_at_monotonic_ns > previous:
             return signals, False
+        if signals.observed_at_monotonic_ns == previous:
+            return (
+                replace(
+                    signals,
+                    observed_at_monotonic_ns=max(
+                        previous + 1,
+                        self._safe_clock(),
+                    ),
+                ),
+                False,
+            )
         adjusted = max(previous + 1, self._safe_clock())
         error = (
             "signal_provider.observe returned a non-monotonic timestamp: "
-            f"{signals.observed_at_monotonic_ns} <= {previous}"
+            f"{signals.observed_at_monotonic_ns} < {previous}"
         )
         return (
             replace(
@@ -204,6 +224,7 @@ class PointerContextSession:
         *,
         focus_epoch: int,
         observed_at_ns: int,
+        reset_for_target_position: bool,
     ) -> tuple[
         PointerContextCandidate,
         int,
@@ -229,7 +250,8 @@ class PointerContextSession:
             )
 
         changed = (
-            self._pending_raw_candidate is not raw_candidate
+            reset_for_target_position
+            or self._pending_raw_candidate is not raw_candidate
             or self._focus_epoch != focus_epoch
             or self._stability_started_at_ns is None
         )
@@ -266,6 +288,25 @@ class PointerContextSession:
             stable_for_ns,
             self._stable_sample_count,
             tuple(extras),
+        )
+
+    def _target_position_changed_locked(
+        self,
+        signals: PointerContextSignals,
+    ) -> bool:
+        previous = self._last_target_client_region
+        current = signals.target_client_region
+        if previous is None or current is None:
+            return False
+        size_matches = (
+            abs(previous.width - current.width) <= self._region_tolerance_px
+            and abs(previous.height - current.height) <= self._region_tolerance_px
+        )
+        if not size_matches:
+            return False
+        return (
+            abs(previous.left - current.left) > self._region_tolerance_px
+            or abs(previous.top - current.top) > self._region_tolerance_px
         )
 
     def _reset_stability_locked(self) -> None:
